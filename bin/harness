@@ -89,7 +89,114 @@ function apply_ops(string $arg, ?int $ops): string
     return str_replace('{ops}', (string)$ops, $arg);
 }
 
-function run_command(array $fullCommand, array $descriptorSpec): array
+function format_duration(int $seconds): string
+{
+    $days = intdiv($seconds, 86400);
+    $seconds -= $days * 86400;
+    $hours = intdiv($seconds, 3600);
+    $seconds -= $hours * 3600;
+    $minutes = intdiv($seconds, 60);
+    $seconds -= $minutes * 60;
+
+    if ($days > 0) {
+        return sprintf('%dd %02d:%02d:%02d', $days, $hours, $minutes, $seconds);
+    }
+
+    return sprintf('%02d:%02d:%02d', $hours, $minutes, $seconds);
+}
+
+function terminal_width(): int
+{
+    $columns = getenv('COLUMNS');
+    if (is_string($columns) && ctype_digit($columns)) {
+        return max(60, (int)$columns);
+    }
+
+    return 80;
+}
+
+function truncate_text(string $text, int $width): string
+{
+    if ($width <= 0) {
+        return '';
+    }
+
+    if (strlen($text) <= $width) {
+        return $text;
+    }
+
+    if ($width <= 3) {
+        return substr($text, 0, $width);
+    }
+
+    return substr($text, 0, $width - 3) . '...';
+}
+
+function pad_line(string $text, int $width): string
+{
+    $text = truncate_text($text, $width);
+    return str_pad($text, $width);
+}
+
+function two_column(string $left, string $right, int $width, int $gap = 3): string
+{
+    $gap = max(1, $gap);
+    $leftWidth = intdiv($width - $gap, 2);
+    $rightWidth = $width - $gap - $leftWidth;
+
+    $left = str_pad(truncate_text($left, $leftWidth), $leftWidth);
+    $right = str_pad(truncate_text($right, $rightWidth), $rightWidth);
+
+    return $left . str_repeat(' ', $gap) . $right;
+}
+
+function render_screen(array $stats, ?int $currentOps, string $mode): void
+{
+    $width = terminal_width();
+    $now = microtime(true);
+    $elapsed = format_duration((int)($now - $stats['start_time']));
+    $sinceFailure = $stats['last_failure_time'] !== null
+        ? format_duration((int)($now - $stats['last_failure_time']))
+        : 'never';
+
+    $lines = [];
+    $lines[] = str_repeat('=', $width);
+    $title = 'relay-table-fuzzer harness';
+    $lines[] = pad_line(str_pad($title, $width, ' ', STR_PAD_BOTH), $width);
+    $lines[] = str_repeat('-', $width);
+    $lines[] = two_column("Elapsed: {$elapsed}", 'Runs: ' . number_format($stats['runs']), $width);
+    $lines[] = two_column('Reproducers: ' . number_format($stats['reproducers']), "Last failure: {$sinceFailure}", $width);
+    $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
+    $lines[] = two_column("Ops: {$opsLabel}", 'Reductions: ' . number_format($stats['reductions']), $width);
+    $lastFailure = $stats['last_failure_summary'] !== '' ? $stats['last_failure_summary'] : 'none';
+    $lines[] = two_column("Mode: {$mode}", "Last crash: {$lastFailure}", $width);
+    $event = $stats['last_event'] !== '' ? $stats['last_event'] : 'none';
+    $lines[] = pad_line("Event: {$event}", $width);
+    $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
+    $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
+    $lines[] = str_repeat('-', $width);
+    $command = $stats['last_command'] ?? '';
+    $lines[] = pad_line("Command: {$command}", $width);
+    $lines[] = str_repeat('=', $width);
+
+    fwrite(STDOUT, "\033[2J\033[H" . implode("\n", $lines) . "\n");
+    fflush(STDOUT);
+}
+
+function find_core_dumps(string $phpBin, ?int $pid): array
+{
+    if ($pid === null) {
+        return [];
+    }
+
+    $binary = basename($phpBin);
+    $pattern = "/tmp/core.{$binary}.{$pid}.*";
+    $cores = glob($pattern);
+
+    return $cores !== false ? $cores : [];
+}
+
+function run_command(array $fullCommand, array $descriptorSpec, string $phpBin): array
 {
     $process = proc_open($fullCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
@@ -114,13 +221,15 @@ function run_command(array $fullCommand, array $descriptorSpec): array
         $signal = $exitCode - 128;
     }
 
-    $isCrash = $signal !== null && in_array($signal, CRASH_SIGNALS, true);
+    $coreFiles = find_core_dumps($phpBin, $pid);
+    $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
 
     return [
         'exit_code' => $exitCode,
         'signal' => $signal,
         'pid' => $pid,
         'is_crash' => $isCrash,
+        'core_files' => $coreFiles,
     ];
 }
 
@@ -129,7 +238,9 @@ function reduce_ops(
     array $dynamicArgs,
     string $phpBin,
     ?string $phpIni,
-    array $descriptorSpec
+    array $descriptorSpec,
+    array &$stats,
+    string $jobDir
 ): int {
     $low = 1;
     $high = $maxOps;
@@ -139,9 +250,18 @@ function reduce_ops(
         $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $mid), $dynamicArgs);
         $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
         $commandString = render_command($fullCommand);
-        fwrite(STDOUT, "Reducing ops: {$mid} -> {$commandString}\n");
 
-        $result = run_command($fullCommand, $descriptorSpec);
+        $result = run_command($fullCommand, $descriptorSpec, $phpBin);
+        $stats['runs']++;
+        $stats['last_command'] = $commandString;
+        $stats['last_event'] = "reducing ops: {$mid}";
+        if ($result['is_crash']) {
+            $stats['last_failure_time'] = microtime(true);
+            $stats['last_failure_summary'] = build_failure_summary($result);
+            $stats['last_event'] = "reducer crash at ops {$mid}";
+            move_core_dumps($result['core_files'], $jobDir);
+        }
+        render_screen($stats, $mid, 'reducing');
         if ($result['is_crash']) {
             $high = $mid;
             continue;
@@ -153,14 +273,9 @@ function reduce_ops(
     return $low;
 }
 
-function move_core_dumps(?int $pid, string $destinationDir): void
+function move_core_dumps(array $coreFiles, string $destinationDir): void
 {
-    if ($pid === null) {
-        return;
-    }
-
-    $pattern = "/tmp/core.*.{$pid}.*";
-    foreach (glob($pattern) as $coreFile) {
+    foreach ($coreFiles as $coreFile) {
         $target = $destinationDir . '/' . basename($coreFile);
         if (@rename($coreFile, $target)) {
             continue;
@@ -170,6 +285,20 @@ function move_core_dumps(?int $pid, string $destinationDir): void
             @unlink($coreFile);
         }
     }
+}
+
+function build_failure_summary(array $result): string
+{
+    if (!empty($result['core_files'])) {
+        $core = basename($result['core_files'][0]);
+        return "core {$core}";
+    }
+
+    if ($result['signal'] !== null) {
+        return signal_label($result['signal']);
+    }
+
+    return 'EXIT_' . $result['exit_code'];
 }
 
 $argv = $_SERVER['argv'];
@@ -269,6 +398,17 @@ $descriptorSpec = [
 ];
 
 $currentOps = $ops;
+$stats = [
+    'start_time' => microtime(true),
+    'runs' => 0,
+    'reproducers' => 0,
+    'last_failure_time' => null,
+    'last_failure_summary' => '',
+    'reductions' => 0,
+    'last_command' => '',
+    'last_event' => '',
+    'last_reproducer' => '',
+];
 
 while (true) {
     $dynamicArgs = array_map('replace_dynamic', $commandArgs);
@@ -276,12 +416,19 @@ while (true) {
     $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
     $commandString = render_command($fullCommand);
 
-    $result = run_command($fullCommand, $descriptorSpec);
+    $result = run_command($fullCommand, $descriptorSpec, $phpBin);
+    $stats['runs']++;
+    $stats['last_command'] = $commandString;
+    $stats['last_event'] = 'running';
+    if ($result['is_crash']) {
+        $stats['last_failure_time'] = microtime(true);
+        $stats['last_failure_summary'] = build_failure_summary($result);
+        $stats['last_event'] = 'crash detected';
+    }
+    render_screen($stats, $currentOps, 'fuzzing');
     if (!$result['is_crash']) {
         continue;
     }
-
-    fwrite(STDOUT, "Crash detected: {$commandString}\n");
 
     $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
     $jobDir = $reproducersDir . '/' . $jobId;
@@ -291,8 +438,8 @@ while (true) {
     $finalOps = $currentOps;
 
     if ($reduce && $currentOps !== null) {
-        fwrite(STDOUT, "Reducing ops starting from {$currentOps}\n");
-        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $descriptorSpec);
+        $stats['reductions']++;
+        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $descriptorSpec, $stats, $jobDir);
         $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
 
@@ -324,12 +471,18 @@ while (true) {
         $report[] = "signal_desc: {$signalDesc}";
     }
     $report[] = "pid: " . ($pid ?? 'unknown');
+    if (!empty($result['core_files'])) {
+        $report[] = 'core_files: ' . implode(', ', array_map('basename', $result['core_files']));
+    }
 
     file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
 
-    move_core_dumps($pid, $jobDir);
+    move_core_dumps($result['core_files'], $jobDir);
 
-    fwrite(STDOUT, "Reproducer saved: {$jobDir}\n");
+    $stats['reproducers']++;
+    $stats['last_event'] = "reproducer saved: {$jobDir}";
+    $stats['last_reproducer'] = $jobDir;
+    render_screen($stats, $currentOps, $reduce ? 'reducing' : 'fuzzing');
 
     if ($reduce && $finalOps !== null) {
         $currentOps = $finalOps;
