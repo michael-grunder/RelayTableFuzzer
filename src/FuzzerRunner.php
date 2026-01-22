@@ -6,6 +6,7 @@ namespace Mgrunder\RelayTableFuzzer;
 
 use Mgrunder\RelayTableFuzzer\Console\Options;
 use Monolog\Logger;
+use Relay\Relay;
 use Relay\Table;
 use Throwable;
 
@@ -80,13 +81,14 @@ final class FuzzerRunner
             $now = microtime(true);
             if ($options->statusInterval > 0 && ($now - $lastReport) >= $options->statusInterval) {
                 $percent = $this->formatPercent($executed, $options->ops);
-                $this->printStatus(sprintf(
+                $message = sprintf(
                     'worker %d: %0.2f%% %d/%d commands executed',
                     $workerId,
                     $percent,
                     $executed,
                     $options->ops
-                ));
+                );
+                $this->printStatus($message . $this->formatMemoryStatusSuffix());
                 $lastReport = $now;
             }
         }
@@ -176,13 +178,14 @@ final class FuzzerRunner
             $now = microtime(true);
             if ($options->statusInterval > 0 && ($now - $lastReport) >= $options->statusInterval) {
                 $percent = $this->formatPercent($executed, $options->ops);
-                $this->printStatus(sprintf(
+                $message = sprintf(
                     'worker %d: %0.2f%% %d/%d commands executed',
                     $workerId,
                     $percent,
                     $executed,
                     $options->ops
-                ));
+                );
+                $this->printStatus($message . $this->formatMemoryStatusSuffix());
                 $lastReport = $now;
             }
         }
@@ -253,6 +256,26 @@ final class FuzzerRunner
             return 0.0;
         }
         return min(100.0, ($done / $total) * 100.0);
+    }
+
+    private function formatMemoryStatusSuffix(): string
+    {
+        if (!class_exists(Relay::class)) {
+            return '';
+        }
+
+        try {
+            $stats = Relay::stats();
+        } catch (Throwable) {
+            return '';
+        }
+
+        $memory = $stats['memory'] ?? null;
+        if (!is_array($memory) || !isset($memory['used'], $memory['total'])) {
+            return '';
+        }
+
+        return sprintf(' mem %d/%d', (int) $memory['used'], (int) $memory['total']);
     }
 
     private function parseHostPort(string $spec): array
