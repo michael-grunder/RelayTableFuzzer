@@ -64,25 +64,25 @@ $logger->info('Fuzzer run configuration', [
 ]);
 
 fwrite(STDOUT, "Relay Table fuzzer starting\n");
-fwrite(STDOUT, sprintf('ops: %d\n', $parsed->ops));
-fwrite(STDOUT, sprintf('workers: %d\n', $parsed->workers));
-fwrite(STDOUT, sprintf('mode: %s\n', $parsed->mode));
-fwrite(STDOUT, sprintf('seed: %d (%s)\n', $parsed->seed, $parsed->seedSource));
-fwrite(STDOUT, sprintf('keys: %d\n', $parsed->keys));
-fwrite(STDOUT, sprintf('namespace: %s\n', $parsed->namespace));
+fwrite(STDOUT, sprintf("ops: %d\n", $parsed->ops));
+fwrite(STDOUT, sprintf("workers: %d\n", $parsed->workers));
+fwrite(STDOUT, sprintf("mode: %s\n", $parsed->mode));
+fwrite(STDOUT, sprintf("seed: %d (%s)\n", $parsed->seed, $parsed->seedSource));
+fwrite(STDOUT, sprintf("keys: %d\n", $parsed->keys));
+fwrite(STDOUT, sprintf("namespace: %s\n", $parsed->namespace));
 if ($parsed->include !== []) {
-    fwrite(STDOUT, sprintf('include: %s\n', implode(',', $parsed->include)));
+    fwrite(STDOUT, sprintf("include: %s\n", implode(',', $parsed->include)));
 }
 if ($parsed->exclude !== []) {
-    fwrite(STDOUT, sprintf('exclude: %s\n', implode(',', $parsed->exclude)));
+    fwrite(STDOUT, sprintf("exclude: %s\n", implode(',', $parsed->exclude)));
 }
-fwrite(STDOUT, sprintf('status interval: %0.2fs\n', $parsed->statusInterval));
+fwrite(STDOUT, sprintf("status interval: %0.2fs\n", $parsed->statusInterval));
 if ($parsed->mode === 'queue') {
-    fwrite(STDOUT, sprintf('redis: %s\n', $parsed->redisSpec));
-    fwrite(STDOUT, sprintf('list: %s\n', $parsed->listName));
+    fwrite(STDOUT, sprintf("redis: %s\n", $parsed->redisSpec));
+    fwrite(STDOUT, sprintf("list: %s\n", $parsed->listName));
 }
-fwrite(STDOUT, sprintf('op set: %s\n', implode(',', $parsed->opSet)));
-fwrite(STDOUT, sprintf('rerun: %s\n', $parsed->rerunCommand));
+fwrite(STDOUT, sprintf("op set: %s\n", implode(',', $parsed->opSet)));
+fwrite(STDOUT, sprintf("rerun: %s\n", $parsed->rerunCommand));
 
 $runner = new FuzzerRunner(new CommandGenerator());
 try {
