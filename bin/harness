@@ -196,8 +196,16 @@ function find_core_dumps(string $phpBin, ?int $pid): array
     return $cores !== false ? $cores : [];
 }
 
-function run_command(array $fullCommand, array $descriptorSpec, string $phpBin): array
+function run_command(array $fullCommand, string $phpBin): array
 {
+    $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
+    $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
+    $descriptorSpec = [
+        0 => ['file', 'php://stdin', 'r'],
+        1 => ['file', $stdoutPath !== false ? $stdoutPath : 'php://stdout', 'w'],
+        2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
+    ];
+
     $process = proc_open($fullCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
@@ -230,6 +238,8 @@ function run_command(array $fullCommand, array $descriptorSpec, string $phpBin):
         'pid' => $pid,
         'is_crash' => $isCrash,
         'core_files' => $coreFiles,
+        'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
+        'stderr_path' => $stderrPath !== false ? $stderrPath : null,
     ];
 }
 
@@ -238,7 +248,6 @@ function reduce_ops(
     array $dynamicArgs,
     string $phpBin,
     ?string $phpIni,
-    array $descriptorSpec,
     array &$stats,
     string $jobDir
 ): int {
@@ -251,7 +260,7 @@ function reduce_ops(
         $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
         $commandString = render_command($fullCommand);
 
-        $result = run_command($fullCommand, $descriptorSpec, $phpBin);
+        $result = run_command($fullCommand, $phpBin);
         $stats['runs']++;
         $stats['last_command'] = $commandString;
         $stats['last_event'] = "reducing ops: {$mid}";
@@ -261,6 +270,7 @@ function reduce_ops(
             $stats['last_event'] = "reducer crash at ops {$mid}";
             move_core_dumps($result['core_files'], $jobDir);
         }
+        cleanup_output_files($result);
         render_screen($stats, $mid, 'reducing');
         if ($result['is_crash']) {
             $high = $mid;
@@ -285,6 +295,48 @@ function move_core_dumps(array $coreFiles, string $destinationDir): void
             @unlink($coreFile);
         }
     }
+}
+
+function cleanup_output_files(array $result): void
+{
+    foreach (['stdout_path', 'stderr_path'] as $key) {
+        $path = $result[$key] ?? null;
+        if (is_string($path) && $path !== '' && file_exists($path)) {
+            @unlink($path);
+        }
+    }
+}
+
+function move_output_files(array $result, string $destinationDir): array
+{
+    $moved = [];
+    $mapping = [
+        'stdout_path' => 'stdout.log',
+        'stderr_path' => 'stderr.log',
+    ];
+
+    foreach ($mapping as $key => $targetName) {
+        $path = $result[$key] ?? null;
+        if (!is_string($path) || $path === '' || !file_exists($path)) {
+            continue;
+        }
+
+        $target = $destinationDir . '/' . $targetName;
+        if (file_exists($target)) {
+            @unlink($target);
+        }
+        if (@rename($path, $target)) {
+            $moved[] = $targetName;
+            continue;
+        }
+
+        if (@copy($path, $target)) {
+            @unlink($path);
+            $moved[] = $targetName;
+        }
+    }
+
+    return $moved;
 }
 
 function build_failure_summary(array $result): string
@@ -391,12 +443,6 @@ if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
 }
 
-$descriptorSpec = [
-    0 => ['file', 'php://stdin', 'r'],
-    1 => ['file', 'php://stdout', 'w'],
-    2 => ['file', 'php://stderr', 'w'],
-];
-
 $currentOps = $ops;
 $stats = [
     'start_time' => microtime(true),
@@ -416,7 +462,7 @@ while (true) {
     $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
     $commandString = render_command($fullCommand);
 
-    $result = run_command($fullCommand, $descriptorSpec, $phpBin);
+    $result = run_command($fullCommand, $phpBin);
     $stats['runs']++;
     $stats['last_command'] = $commandString;
     $stats['last_event'] = 'running';
@@ -427,6 +473,7 @@ while (true) {
     }
     render_screen($stats, $currentOps, 'fuzzing');
     if (!$result['is_crash']) {
+        cleanup_output_files($result);
         continue;
     }
 
@@ -439,7 +486,7 @@ while (true) {
 
     if ($reduce && $currentOps !== null) {
         $stats['reductions']++;
-        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $descriptorSpec, $stats, $jobDir);
+        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir);
         $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
 
@@ -449,6 +496,9 @@ while (true) {
     }
 
     file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+
+    $outputFiles = move_output_files($result, $jobDir);
+    cleanup_output_files($result);
 
     $signal = $result['signal'];
     $exitCode = $result['exit_code'];
@@ -473,6 +523,9 @@ while (true) {
     $report[] = "pid: " . ($pid ?? 'unknown');
     if (!empty($result['core_files'])) {
         $report[] = 'core_files: ' . implode(', ', array_map('basename', $result['core_files']));
+    }
+    if ($outputFiles !== []) {
+        $report[] = 'output_files: ' . implode(', ', $outputFiles);
     }
 
     file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
