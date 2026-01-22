@@ -160,6 +160,8 @@ while (true) {
     $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
     $commandString = render_command($fullCommand);
 
+var_dump($commandString); die();
+
     $process = proc_open($fullCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
