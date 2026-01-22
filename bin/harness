@@ -1,0 +1,220 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+const CRASH_SIGNALS = [
+    SIGSEGV,
+    SIGBUS,
+    SIGILL,
+    SIGABRT,
+    SIGFPE,
+    SIGTRAP,
+];
+
+const SIGNAL_LABELS = [
+    SIGSEGV => 'SIGSEGV',
+    SIGBUS => 'SIGBUS',
+    SIGILL => 'SIGILL',
+    SIGABRT => 'SIGABRT',
+    SIGFPE => 'SIGFPE',
+    SIGTRAP => 'SIGTRAP',
+];
+
+function usage(string $script): string
+{
+    return <<<USAGE
+Usage:
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] -- <command...>
+
+Dynamic replacements in command arguments:
+  {range}            -> random integer
+  {range(lo,hi)}     -> random integer between lo and hi (inclusive)
+  {hrtime}           -> hrtime(true)
+USAGE;
+}
+
+function render_command(array $command): string
+{
+    return implode(' ', array_map('escapeshellarg', $command));
+}
+
+function signal_label(int $signal): string
+{
+    return SIGNAL_LABELS[$signal] ?? "SIG{$signal}";
+}
+
+function signal_description(int $signal): string
+{
+    if (function_exists('pcntl_strsignal')) {
+        $desc = pcntl_strsignal($signal);
+        if (is_string($desc) && $desc !== '') {
+            return $desc;
+        }
+    }
+
+    return '';
+}
+
+function replace_dynamic(string $arg): string
+{
+    $arg = preg_replace_callback('/\{range\((\-?\d+)\s*,\s*(\-?\d+)\)\}/', static function (array $matches): string {
+        $lo = (int)$matches[1];
+        $hi = (int)$matches[2];
+        if ($lo > $hi) {
+            [$lo, $hi] = [$hi, $lo];
+        }
+
+        return (string)random_int($lo, $hi);
+    }, $arg);
+
+    $arg = preg_replace_callback('/\{range\}/', static function (): string {
+        return (string)random_int(0, PHP_INT_MAX);
+    }, $arg);
+
+    $arg = preg_replace_callback('/\{hrtime\}/', static function (): string {
+        return (string)hrtime(true);
+    }, $arg);
+
+    return $arg;
+}
+
+function move_core_dumps(?int $pid, string $destinationDir): void
+{
+    if ($pid === null) {
+        return;
+    }
+
+    $pattern = "/tmp/core.*.{$pid}.*";
+    foreach (glob($pattern) as $coreFile) {
+        $target = $destinationDir . '/' . basename($coreFile);
+        if (@rename($coreFile, $target)) {
+            continue;
+        }
+
+        if (@copy($coreFile, $target)) {
+            @unlink($coreFile);
+        }
+    }
+}
+
+$argv = $_SERVER['argv'];
+$argc = $_SERVER['argc'];
+
+$phpBin = null;
+$phpIni = null;
+$commandArgs = [];
+
+for ($i = 1; $i < $argc; $i++) {
+    $arg = $argv[$i];
+    if ($arg === '--') {
+        $commandArgs = array_slice($argv, $i + 1);
+        break;
+    }
+
+    if ($arg === '--help' || $arg === '-h') {
+        fwrite(STDOUT, usage($argv[0]) . "\n");
+        exit(0);
+    }
+
+    if ($arg === '--php-bin') {
+        $phpBin = $argv[++$i] ?? null;
+        continue;
+    }
+
+    if ($arg === '--php-ini') {
+        $phpIni = $argv[++$i] ?? null;
+        continue;
+    }
+
+    fwrite(STDERR, "Unknown option: {$arg}\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($phpBin === null || $phpBin === '') {
+    fwrite(STDERR, "Missing required --php-bin\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($commandArgs === []) {
+    fwrite(STDERR, "Missing command after --\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+$reproducersDir = __DIR__ . '/../reproducers';
+if (!is_dir($reproducersDir)) {
+    mkdir($reproducersDir, 0777, true);
+}
+
+$descriptorSpec = [
+    0 => ['file', 'php://stdin', 'r'],
+    1 => ['file', 'php://stdout', 'w'],
+    2 => ['file', 'php://stderr', 'w'],
+];
+
+while (true) {
+    $runArgs = array_map('replace_dynamic', $commandArgs);
+    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+    $commandString = render_command($fullCommand);
+
+    $process = proc_open($fullCommand, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        fwrite(STDERR, "Failed to start process\n");
+        exit(1);
+    }
+
+    $status = proc_get_status($process);
+    $pid = $status['pid'] ?? null;
+
+    while ($status['running']) {
+        usleep(10000);
+        $status = proc_get_status($process);
+    }
+
+    $exitCode = proc_close($process);
+
+    $signal = null;
+    if (($status['signaled'] ?? false) && isset($status['termsig'])) {
+        $signal = (int)$status['termsig'];
+    } elseif ($exitCode !== 0 && $exitCode > 128) {
+        $signal = $exitCode - 128;
+    }
+
+    $isCrash = $signal !== null && in_array($signal, CRASH_SIGNALS, true);
+    if (!$isCrash) {
+        continue;
+    }
+
+    fwrite(STDOUT, "Crash detected: {$commandString}\n");
+
+    $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
+    $jobDir = $reproducersDir . '/' . $jobId;
+    mkdir($jobDir, 0777, true);
+
+    file_put_contents($jobDir . '/command.txt', $commandString . "\n");
+
+    $signalLabel = $signal !== null ? signal_label($signal) : 'none';
+    $signalDesc = $signal !== null ? signal_description($signal) : '';
+    $exitName = $signal !== null ? $signalLabel : "EXIT_{$exitCode}";
+
+    $report = [
+        "command: {$commandString}",
+        "exit_code: {$exitCode}",
+        "exit_name: {$exitName}",
+        "signal: {$signalLabel}",
+    ];
+    if ($signalDesc !== '') {
+        $report[] = "signal_desc: {$signalDesc}";
+    }
+    $report[] = "pid: " . ($pid ?? 'unknown');
+
+    file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
+
+    move_core_dumps($pid, $jobDir);
+
+    fwrite(STDOUT, "Reproducer saved: {$jobDir}\n");
+    exit(1);
+}
