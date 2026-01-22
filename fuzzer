@@ -4,6 +4,11 @@
 declare(strict_types=1);
 
 use Relay\Table;
+use Monolog\Handler\StreamHandler;
+use Monolog\Logger;
+use Psr\Log\InvalidArgumentException;
+
+require_once __DIR__ . '/vendor/autoload.php';
 
 function usage(): void
 {
@@ -14,11 +19,13 @@ Usage:
   ./fuzzer --ops N [--workers N] [--seed INT] [--keys N]
            [--include csl] [--exclude csl]
            [--mode random|queue] [--redis host:port] [--list name]
+           [--log-level level]
 
 Notes:
   - If --seed is omitted, hrtime(true) is used.
   - If --workers=0, no fork is performed.
   - --mode=queue uses Redis; parent enqueues commands to a list and children pop.
+  - --log-level accepts Monolog/PSR-3 levels (debug, info, notice, warning, error, critical, alert, emergency).
 
 TXT;
     fwrite(STDERR, $msg);
@@ -31,6 +38,14 @@ function parse_csl(?string $value): array
     }
     $items = array_map('trim', explode(',', $value));
     return array_values(array_filter($items, static fn($item) => $item !== ''));
+}
+
+function create_logger(string $level): Logger
+{
+    $logger = new Logger('relay-table-fuzzer');
+    $handler = new StreamHandler('php://stderr', Logger::toMonologLevel($level));
+    $logger->pushHandler($handler);
+    return $logger;
 }
 
 function pick_key(int $keys): string
@@ -178,6 +193,7 @@ $options = getopt('', [
     'mode::',
     'redis::',
     'list::',
+    'log-level::',
     'help::',
 ]);
 
@@ -193,6 +209,14 @@ $keys = isset($options['keys']) ? (int) $options['keys'] : 16;
 $mode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'random';
 $redisSpec = isset($options['redis']) ? (string) $options['redis'] : '127.0.0.1:6379';
 $listName = isset($options['list']) ? (string) $options['list'] : 'relay-table-fuzzer';
+$logLevel = isset($options['log-level']) ? strtolower((string) $options['log-level']) : 'info';
+
+try {
+    $logger = create_logger($logLevel);
+} catch (InvalidArgumentException $e) {
+    fwrite(STDERR, "Invalid --log-level: {$logLevel}\n");
+    exit(1);
+}
 
 if ($ops <= 0 || $keys <= 0 || $workers < 0) {
     fwrite(STDERR, "Invalid --ops, --keys, or --workers value.\n");
@@ -220,6 +244,50 @@ if ($opSet === []) {
 }
 
 $namespace = 'fuzz:' . $seed;
+$seedSource = isset($options['seed']) ? 'provided' : 'generated';
+$includeRaw = isset($options['include']) ? (string) $options['include'] : '';
+$excludeRaw = isset($options['exclude']) ? (string) $options['exclude'] : '';
+
+$rerunParts = [
+    './fuzzer',
+    '--ops', (string) $ops,
+    '--seed', (string) $seed,
+    '--workers', (string) $workers,
+    '--keys', (string) $keys,
+    '--mode', $mode,
+    '--log-level', $logLevel,
+];
+if ($includeRaw !== '') {
+    $rerunParts[] = '--include';
+    $rerunParts[] = $includeRaw;
+}
+if ($excludeRaw !== '') {
+    $rerunParts[] = '--exclude';
+    $rerunParts[] = $excludeRaw;
+}
+if ($mode === 'queue') {
+    $rerunParts[] = '--redis';
+    $rerunParts[] = $redisSpec;
+    $rerunParts[] = '--list';
+    $rerunParts[] = $listName;
+}
+$rerunCommand = implode(' ', array_map('escapeshellarg', $rerunParts));
+
+$logger->info('Fuzzer run configuration', [
+    'mode' => $mode,
+    'ops' => $ops,
+    'seed' => $seed,
+    'seed_source' => $seedSource,
+    'workers' => $workers,
+    'keys' => $keys,
+    'namespace' => $namespace,
+    'include' => $include,
+    'exclude' => $exclude,
+    'op_set' => $opSet,
+    'redis' => $redisSpec,
+    'list' => $listName,
+    'rerun' => $rerunCommand,
+]);
 
 if ($mode === 'queue') {
     if (!class_exists('Redis')) {
