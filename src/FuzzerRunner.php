@@ -65,7 +65,6 @@ final class FuzzerRunner
     private function runRandomWorker(int $workerId, Options $options, Logger $logger): void
     {
         mt_srand($options->seed + $workerId);
-        $table = new Table($options->namespace);
         $start = microtime(true);
         $lastReport = $start;
         $executed = 0;
@@ -73,7 +72,7 @@ final class FuzzerRunner
         for ($i = 0; $i < $options->ops; $i++) {
             $cmd = $this->generator->generate($options->opSet, $options->keys);
             try {
-                $this->executeCommand($table, $cmd, $logger, $workerId);
+                $this->executeCommand($options->namespace, $cmd, $logger, $workerId);
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
             }
@@ -155,7 +154,6 @@ final class FuzzerRunner
 
     private function runQueueConsumer(\Redis $redis, string $queueName, int $workerId, Options $options, Logger $logger): void
     {
-        $table = new Table($options->namespace);
         $start = microtime(true);
         $lastReport = $start;
         $executed = 0;
@@ -170,7 +168,7 @@ final class FuzzerRunner
                 continue;
             }
             try {
-                $this->executeCommand($table, $cmd, $logger, $workerId);
+                $this->executeCommand($options->namespace, $cmd, $logger, $workerId);
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
             }
@@ -201,7 +199,7 @@ final class FuzzerRunner
         ));
     }
 
-    private function executeCommand(Table $table, array $cmd, Logger $logger, int $workerId): void
+    private function executeCommand(string $namespace, array $cmd, Logger $logger, int $workerId): void
     {
         $op = $cmd['op'] ?? '';
         $logger->debug('Executing command', [
@@ -211,28 +209,30 @@ final class FuzzerRunner
 
         switch ($op) {
             case 'get':
-                $table->get((string) $cmd['key']);
-                break;
-            case 'pluck':
-                $table->pluck((string) $cmd['key'], (string) $cmd['field']);
+                Table::get((string) $cmd['key'], $namespace);
                 break;
             case 'set':
-                $table->set((string) $cmd['key'], $cmd['value'] ?? null);
+                Table::set(
+                    (string) $cmd['key'],
+                    $cmd['value'] ?? null,
+                    $cmd['expire'] ?? null,
+                    $namespace
+                );
                 break;
             case 'exists':
-                $table->exists((string) $cmd['key']);
+                Table::exists((string) $cmd['key'], $namespace);
                 break;
             case 'delete':
-                $table->delete((string) $cmd['key']);
+                Table::delete((string) $cmd['key'], $namespace);
+                break;
+            case 'ttl':
+                Table::ttl((string) $cmd['key'], $namespace);
                 break;
             case 'count':
-                $table->count();
-                break;
-            case 'namespace':
-                $table->namespace();
+                Table::count($namespace);
                 break;
             case 'clear':
-                $table->clear();
+                Table::clear($namespace);
                 break;
             case 'namespaces':
                 Table::namespaces();

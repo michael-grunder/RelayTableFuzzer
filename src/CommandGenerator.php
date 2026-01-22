@@ -15,18 +15,18 @@ final class CommandGenerator
             case 'get':
             case 'exists':
             case 'delete':
+            case 'ttl':
                 $cmd['key'] = $this->pickKey($keys);
                 break;
             case 'set':
                 $cmd['key'] = $this->pickKey($keys);
                 $cmd['value'] = $this->randomValue();
-                break;
-            case 'pluck':
-                $cmd['key'] = $this->pickKey($keys);
-                $cmd['field'] = 'field:' . mt_rand(0, 3);
+                $expire = $this->randomExpire();
+                if ($expire !== null) {
+                    $cmd['expire'] = $expire;
+                }
                 break;
             case 'count':
-            case 'namespace':
             case 'clear':
             case 'namespaces':
             case 'clearAll':
@@ -77,5 +77,13 @@ final class CommandGenerator
             $out .= $chars[mt_rand(0, $max)];
         }
         return $out;
+    }
+
+    private function randomExpire(): ?int
+    {
+        if (mt_rand(0, 2) === 0) {
+            return null;
+        }
+        return mt_rand(1, 300);
     }
 }

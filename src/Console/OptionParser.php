@@ -9,7 +9,7 @@ use RuntimeException;
 final class OptionParser
 {
     private const ALL_OPS = [
-        'get', 'pluck', 'set', 'exists', 'delete', 'count', 'namespace', 'clear', 'namespaces', 'clearAll',
+        'get', 'set', 'exists', 'delete', 'ttl', 'count', 'clear', 'namespaces', 'clearAll',
     ];
 
     public static function parse(array $options, string $invocation): Options
