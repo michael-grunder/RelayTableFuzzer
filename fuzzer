@@ -1,0 +1,339 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Relay\Table;
+
+function usage(): void
+{
+    $msg = <<<TXT
+Relay Table fuzzer
+
+Usage:
+  ./fuzzer --ops N [--workers N] [--seed INT] [--keys N]
+           [--include csl] [--exclude csl]
+           [--mode random|queue] [--redis host:port] [--list name]
+
+Notes:
+  - If --seed is omitted, hrtime(true) is used.
+  - If --workers=0, no fork is performed.
+  - --mode=queue uses Redis; parent enqueues commands to a list and children pop.
+
+TXT;
+    fwrite(STDERR, $msg);
+}
+
+function parse_csl(?string $value): array
+{
+    if ($value === null || $value === '') {
+        return [];
+    }
+    $items = array_map('trim', explode(',', $value));
+    return array_values(array_filter($items, static fn($item) => $item !== ''));
+}
+
+function pick_key(int $keys): string
+{
+    $idx = mt_rand(0, $keys - 1);
+    return 'key:' . $idx;
+}
+
+function random_string(int $len): string
+{
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    $max = strlen($chars) - 1;
+    $out = '';
+    for ($i = 0; $i < $len; $i++) {
+        $out .= $chars[mt_rand(0, $max)];
+    }
+    return $out;
+}
+
+function random_value(): mixed
+{
+    $choice = mt_rand(0, 3);
+    switch ($choice) {
+        case 0:
+            return mt_rand(-100000, 100000);
+        case 1:
+            return mt_rand() / (mt_rand(1, 1000));
+        case 2:
+            return random_string(mt_rand(1, 24));
+        case 3:
+            $fields = mt_rand(1, 4);
+            $arr = [];
+            for ($i = 0; $i < $fields; $i++) {
+                $arr['field:' . $i] = random_string(mt_rand(1, 10));
+            }
+            return $arr;
+        default:
+            return null;
+    }
+}
+
+function generate_command(array $ops, int $keys): array
+{
+    $op = $ops[mt_rand(0, count($ops) - 1)];
+    $cmd = ['op' => $op];
+
+    switch ($op) {
+        case 'get':
+        case 'exists':
+        case 'delete':
+            $cmd['key'] = pick_key($keys);
+            break;
+        case 'set':
+            $cmd['key'] = pick_key($keys);
+            $cmd['value'] = random_value();
+            break;
+        case 'pluck':
+            $cmd['key'] = pick_key($keys);
+            $cmd['field'] = 'field:' . mt_rand(0, 3);
+            break;
+        case 'count':
+        case 'namespace':
+        case 'clear':
+        case 'namespaces':
+        case 'clearAll':
+            break;
+        default:
+            $cmd['op'] = 'get';
+            $cmd['key'] = pick_key($keys);
+            break;
+    }
+
+    return $cmd;
+}
+
+function execute_command(Table $table, array $cmd): void
+{
+    $op = $cmd['op'] ?? '';
+    switch ($op) {
+        case 'get':
+            $table->get((string) $cmd['key']);
+            break;
+        case 'pluck':
+            $table->pluck((string) $cmd['key'], (string) $cmd['field']);
+            break;
+        case 'set':
+            $table->set((string) $cmd['key'], $cmd['value'] ?? null);
+            break;
+        case 'exists':
+            $table->exists((string) $cmd['key']);
+            break;
+        case 'delete':
+            $table->delete((string) $cmd['key']);
+            break;
+        case 'count':
+            $table->count();
+            break;
+        case 'namespace':
+            $table->namespace();
+            break;
+        case 'clear':
+            $table->clear();
+            break;
+        case 'namespaces':
+            Table::namespaces();
+            break;
+        case 'clearAll':
+            Table::clearAll();
+            break;
+        default:
+            break;
+    }
+}
+
+function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array $opSet, string $namespace): void
+{
+    mt_srand($seed + $workerId);
+    $table = new Table($namespace);
+
+    for ($i = 0; $i < $ops; $i++) {
+        $cmd = generate_command($opSet, $keys);
+        try {
+            execute_command($table, $cmd);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
+        }
+    }
+}
+
+function parse_host_port(string $spec): array
+{
+    $parts = explode(':', $spec, 2);
+    $host = $parts[0] !== '' ? $parts[0] : '127.0.0.1';
+    $port = isset($parts[1]) && $parts[1] !== '' ? (int) $parts[1] : 6379;
+    return [$host, $port];
+}
+
+$options = getopt('', [
+    'workers::',
+    'seed::',
+    'ops:',
+    'keys::',
+    'include::',
+    'exclude::',
+    'mode::',
+    'redis::',
+    'list::',
+    'help::',
+]);
+
+if (isset($options['help']) || !isset($options['ops'])) {
+    usage();
+    exit(isset($options['ops']) ? 0 : 1);
+}
+
+$workers = isset($options['workers']) ? (int) $options['workers'] : 0;
+$ops = (int) $options['ops'];
+$seed = isset($options['seed']) ? (int) $options['seed'] : (int) hrtime(true);
+$keys = isset($options['keys']) ? (int) $options['keys'] : 16;
+$mode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'random';
+$redisSpec = isset($options['redis']) ? (string) $options['redis'] : '127.0.0.1:6379';
+$listName = isset($options['list']) ? (string) $options['list'] : 'relay-table-fuzzer';
+
+if ($ops <= 0 || $keys <= 0 || $workers < 0) {
+    fwrite(STDERR, "Invalid --ops, --keys, or --workers value.\n");
+    exit(1);
+}
+
+$allOps = [
+    'get', 'pluck', 'set', 'exists', 'delete', 'count', 'namespace', 'clear', 'namespaces', 'clearAll',
+];
+
+$include = parse_csl($options['include'] ?? null);
+$exclude = parse_csl($options['exclude'] ?? null);
+
+$opSet = $allOps;
+if ($include !== []) {
+    $opSet = array_values(array_intersect($opSet, $include));
+}
+if ($exclude !== []) {
+    $opSet = array_values(array_diff($opSet, $exclude));
+}
+
+if ($opSet === []) {
+    fwrite(STDERR, "No operations selected after include/exclude filtering.\n");
+    exit(1);
+}
+
+$namespace = 'fuzz:' . $seed;
+
+if ($mode === 'queue') {
+    if (!class_exists('Redis')) {
+        fwrite(STDERR, "Redis extension is required for --mode=queue.\n");
+        exit(1);
+    }
+
+    [$host, $port] = parse_host_port($redisSpec);
+    $redis = new Redis();
+    if (!$redis->connect($host, $port, 2.5)) {
+        fwrite(STDERR, "Failed to connect to Redis at {$host}:{$port}.\n");
+        exit(1);
+    }
+
+    $queueName = $listName . ':' . $seed;
+
+    mt_srand($seed);
+    for ($i = 0; $i < $ops; $i++) {
+        $cmd = generate_command($opSet, $keys);
+        $redis->rPush($queueName, json_encode($cmd, JSON_UNESCAPED_SLASHES));
+    }
+
+    if ($workers === 0) {
+        $table = new Table($namespace);
+        while (true) {
+            $payload = $redis->lPop($queueName);
+            if ($payload === false) {
+                break;
+            }
+            $cmd = json_decode($payload, true);
+            if (!is_array($cmd)) {
+                continue;
+            }
+            try {
+                execute_command($table, $cmd);
+            } catch (Throwable $e) {
+                fwrite(STDERR, "worker 0 error: {$e->getMessage()}\n");
+            }
+        }
+        exit(0);
+    }
+
+    if (!function_exists('pcntl_fork')) {
+        fwrite(STDERR, "pcntl extension is required for workers > 0.\n");
+        exit(1);
+    }
+
+    $pids = [];
+    for ($i = 0; $i < $workers; $i++) {
+        $pid = pcntl_fork();
+        if ($pid === -1) {
+            fwrite(STDERR, "Failed to fork worker {$i}.\n");
+            exit(1);
+        }
+        if ($pid === 0) {
+            $table = new Table($namespace);
+            while (true) {
+                $payload = $redis->lPop($queueName);
+                if ($payload === false) {
+                    break;
+                }
+                $cmd = json_decode($payload, true);
+                if (!is_array($cmd)) {
+                    continue;
+                }
+                try {
+                    execute_command($table, $cmd);
+                } catch (Throwable $e) {
+                    fwrite(STDERR, "worker {$i} error: {$e->getMessage()}\n");
+                }
+            }
+            exit(0);
+        }
+        $pids[] = $pid;
+    }
+
+    foreach ($pids as $pid) {
+        pcntl_waitpid($pid, $status);
+    }
+
+    exit(0);
+}
+
+if ($mode !== 'random') {
+    fwrite(STDERR, "Unknown --mode: {$mode}. Use random or queue.\n");
+    exit(1);
+}
+
+if ($workers === 0) {
+    run_random_worker(0, $seed, $ops, $keys, $opSet, $namespace);
+    exit(0);
+}
+
+if (!function_exists('pcntl_fork')) {
+    fwrite(STDERR, "pcntl extension is required for workers > 0.\n");
+    exit(1);
+}
+
+$pids = [];
+for ($i = 0; $i < $workers; $i++) {
+    $pid = pcntl_fork();
+    if ($pid === -1) {
+        fwrite(STDERR, "Failed to fork worker {$i}.\n");
+        exit(1);
+    }
+    if ($pid === 0) {
+        run_random_worker($i, $seed, $ops, $keys, $opSet, $namespace);
+        exit(0);
+    }
+    $pids[] = $pid;
+}
+
+foreach ($pids as $pid) {
+    pcntl_waitpid($pid, $status);
+}
+
+exit(0);
