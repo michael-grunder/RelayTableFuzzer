@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -196,7 +196,7 @@ function find_core_dumps(string $phpBin, ?int $pid): array
     return $cores !== false ? $cores : [];
 }
 
-function run_command(array $fullCommand, string $phpBin): array
+function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): array
 {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
@@ -214,10 +214,32 @@ function run_command(array $fullCommand, string $phpBin): array
 
     $status = proc_get_status($process);
     $pid = $status['pid'] ?? null;
+    $start = microtime(true);
+    $timedOut = false;
 
     while ($status['running']) {
         usleep(10000);
+        if ($maxSeconds !== null && (microtime(true) - $start) >= $maxSeconds) {
+            $timedOut = true;
+            proc_terminate($process);
+            usleep(100000);
+            $status = proc_get_status($process);
+            if ($status['running']) {
+                proc_terminate($process, SIGKILL);
+            }
+            break;
+        }
         $status = proc_get_status($process);
+    }
+
+    if ($status['running']) {
+        for ($i = 0; $i < 50; $i++) {
+            usleep(100000);
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                break;
+            }
+        }
     }
 
     $exitCode = proc_close($process);
@@ -230,12 +252,13 @@ function run_command(array $fullCommand, string $phpBin): array
     }
 
     $coreFiles = find_core_dumps($phpBin, $pid);
-    $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
+    $isCrash = $timedOut || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
 
     return [
         'exit_code' => $exitCode,
         'signal' => $signal,
         'pid' => $pid,
+        'timed_out' => $timedOut,
         'is_crash' => $isCrash,
         'core_files' => $coreFiles,
         'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
@@ -249,7 +272,8 @@ function reduce_ops(
     string $phpBin,
     ?string $phpIni,
     array &$stats,
-    string $jobDir
+    string $jobDir,
+    ?int $maxSeconds
 ): int {
     $low = 1;
     $high = $maxOps;
@@ -260,7 +284,7 @@ function reduce_ops(
         $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
         $commandString = render_command($fullCommand);
 
-        $result = run_command($fullCommand, $phpBin);
+        $result = run_command($fullCommand, $phpBin, $maxSeconds);
         $stats['runs']++;
         $stats['last_command'] = $commandString;
         $stats['last_event'] = "reducing ops: {$mid}";
@@ -341,6 +365,10 @@ function move_output_files(array $result, string $destinationDir): array
 
 function build_failure_summary(array $result): string
 {
+    if (!empty($result['timed_out'])) {
+        return 'TIMEOUT';
+    }
+
     if (!empty($result['core_files'])) {
         $core = basename($result['core_files'][0]);
         return "core {$core}";
@@ -360,6 +388,7 @@ $phpBin = null;
 $phpIni = null;
 $ops = null;
 $reduce = false;
+$maxSeconds = null;
 $commandArgs = [];
 
 for ($i = 1; $i < $argc; $i++) {
@@ -392,6 +421,12 @@ for ($i = 1; $i < $argc; $i++) {
 
     if ($arg === '--reduce') {
         $reduce = true;
+        continue;
+    }
+
+    if ($arg === '--max-seconds') {
+        $maxSeconds = $argv[++$i] ?? null;
+        $maxSeconds = is_numeric($maxSeconds) ? (int)$maxSeconds : null;
         continue;
     }
 
@@ -438,6 +473,12 @@ if ($reduce && ($ops === null || $ops <= 0)) {
     exit(1);
 }
 
+if ($maxSeconds !== null && $maxSeconds <= 0) {
+    fwrite(STDERR, "--max-seconds requires a positive integer\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 $reproducersDir = __DIR__ . '/../reproducers';
 if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
@@ -462,7 +503,7 @@ while (true) {
     $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
     $commandString = render_command($fullCommand);
 
-    $result = run_command($fullCommand, $phpBin);
+    $result = run_command($fullCommand, $phpBin, $maxSeconds);
     $stats['runs']++;
     $stats['last_command'] = $commandString;
     $stats['last_event'] = 'running';
@@ -486,7 +527,7 @@ while (true) {
 
     if ($reduce && $currentOps !== null) {
         $stats['reductions']++;
-        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir);
+        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir, $maxSeconds);
         $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
 
@@ -506,7 +547,9 @@ while (true) {
 
     $signalLabel = $signal !== null ? signal_label($signal) : 'none';
     $signalDesc = $signal !== null ? signal_description($signal) : '';
-    $exitName = $signal !== null ? $signalLabel : "EXIT_{$exitCode}";
+    $exitName = !empty($result['timed_out'])
+        ? 'TIMEOUT'
+        : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
 
     $report = [
         "command: {$finalCommand}",
@@ -519,6 +562,12 @@ while (true) {
     }
     if ($signalDesc !== '') {
         $report[] = "signal_desc: {$signalDesc}";
+    }
+    if (!empty($result['timed_out'])) {
+        $report[] = 'timed_out: yes';
+        if ($maxSeconds !== null) {
+            $report[] = "max_seconds: {$maxSeconds}";
+        }
     }
     $report[] = "pid: " . ($pid ?? 'unknown');
     if (!empty($result['core_files'])) {
