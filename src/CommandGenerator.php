@@ -6,7 +6,7 @@ namespace Mgrunder\RelayTableFuzzer;
 
 final class CommandGenerator
 {
-    public function generate(array $ops, int $keys): array
+    public function generate(array $ops, int $keys, int $maxKeySize, int $maxMems): array
     {
         $op = $ops[mt_rand(0, count($ops) - 1)];
         $cmd = ['op' => $op];
@@ -20,7 +20,7 @@ final class CommandGenerator
                 break;
             case 'set':
                 $cmd['key'] = $this->pickKey($keys);
-                $cmd['value'] = $this->randomValue();
+                $cmd['value'] = $this->randomValue($maxKeySize, $maxMems);
                 $expire = $this->randomExpire();
                 if ($expire !== null) {
                     $cmd['expire'] = $expire;
@@ -46,23 +46,33 @@ final class CommandGenerator
         return 'key:' . $idx;
     }
 
-    private function randomValue(): mixed
+    private function randomValue(int $maxKeySize, int $maxMems): mixed
     {
-        $choice = mt_rand(0, 3);
+        if (mt_rand(0, 4) < 4) {
+            return $this->randomScalarValue($maxKeySize);
+        }
+        $fields = mt_rand(1, $maxMems);
+        $arr = [];
+        for ($i = 0; $i < $fields; $i++) {
+            $arr['field:' . $i] = $this->randomScalarValue($maxKeySize);
+        }
+        return $arr;
+    }
+
+    private function randomScalarValue(int $maxKeySize): mixed
+    {
+        $choice = mt_rand(0, 4);
         switch ($choice) {
             case 0:
                 return mt_rand(-100000, 100000);
             case 1:
                 return mt_rand() / (mt_rand(1, 1000));
             case 2:
-                return $this->randomString(mt_rand(1, 24));
+                return $this->randomString(mt_rand(1, $maxKeySize));
             case 3:
-                $fields = mt_rand(1, 4);
-                $arr = [];
-                for ($i = 0; $i < $fields; $i++) {
-                    $arr['field:' . $i] = $this->randomString(mt_rand(1, 10));
-                }
-                return $arr;
+                return (bool) mt_rand(0, 1);
+            case 4:
+                return null;
             default:
                 return null;
         }

@@ -70,7 +70,12 @@ final class FuzzerRunner
         $executed = 0;
 
         for ($i = 0; $i < $options->ops; $i++) {
-            $cmd = $this->generator->generate($options->opSet, $options->keys);
+            $cmd = $this->generator->generate(
+                $options->opSet,
+                $options->keys,
+                $options->maxKeySize,
+                $options->maxMems
+            );
             try {
                 $this->executeCommand($options->namespace, $cmd, $logger, $workerId);
             } catch (Throwable $e) {
@@ -119,7 +124,12 @@ final class FuzzerRunner
 
         mt_srand($options->seed);
         for ($i = 0; $i < $options->ops; $i++) {
-            $cmd = $this->generator->generate($options->opSet, $options->keys);
+            $cmd = $this->generator->generate(
+                $options->opSet,
+                $options->keys,
+                $options->maxKeySize,
+                $options->maxMems
+            );
             $redis->rPush($queueName, json_encode($cmd, JSON_UNESCAPED_SLASHES));
         }
 

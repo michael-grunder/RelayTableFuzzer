@@ -18,14 +18,16 @@ final class OptionParser
         $ops = (int) $options['ops'];
         $seed = isset($options['seed']) ? (int) $options['seed'] : (int) hrtime(true);
         $keys = isset($options['keys']) ? (int) $options['keys'] : 16;
+        $maxKeySize = isset($options['max-key-size']) ? (int) $options['max-key-size'] : 24;
+        $maxMems = isset($options['max-mems']) ? (int) $options['max-mems'] : 4;
         $mode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'random';
         $redisSpec = isset($options['redis']) ? (string) $options['redis'] : '127.0.0.1:6379';
         $listName = isset($options['list']) ? (string) $options['list'] : 'relay-table-fuzzer';
         $logLevel = isset($options['log-level']) ? strtolower((string) $options['log-level']) : 'info';
         $statusInterval = isset($options['status-interval']) ? (float) $options['status-interval'] : 1.0;
 
-        if ($ops <= 0 || $keys <= 0 || $workers < 0 || $statusInterval <= 0) {
-            throw new RuntimeException('Invalid --ops, --keys, --workers, or --status-interval value.');
+        if ($ops <= 0 || $keys <= 0 || $maxKeySize <= 0 || $maxMems <= 0 || $workers < 0 || $statusInterval <= 0) {
+            throw new RuntimeException('Invalid --ops, --keys, --max-key-size, --max-mems, --workers, or --status-interval value.');
         }
 
         $includeRaw = isset($options['include']) ? (string) $options['include'] : '';
@@ -54,6 +56,8 @@ final class OptionParser
             $seed,
             $workers,
             $keys,
+            $maxKeySize,
+            $maxMems,
             $mode,
             $logLevel,
             $redisSpec,
@@ -69,6 +73,8 @@ final class OptionParser
             $ops,
             $seed,
             $keys,
+            $maxKeySize,
+            $maxMems,
             $mode,
             $redisSpec,
             $listName,
@@ -100,6 +106,8 @@ final class OptionParser
         int $seed,
         int $workers,
         int $keys,
+        int $maxKeySize,
+        int $maxMems,
         string $mode,
         string $logLevel,
         string $redisSpec,
@@ -115,6 +123,8 @@ final class OptionParser
             '--seed', (string) $seed,
             '--workers', (string) $workers,
             '--keys', (string) $keys,
+            '--max-key-size', (string) $maxKeySize,
+            '--max-mems', (string) $maxMems,
             '--mode', $mode,
             '--log-level', $logLevel,
         ];

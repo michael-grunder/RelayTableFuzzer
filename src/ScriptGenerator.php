@@ -24,7 +24,15 @@ final class ScriptGenerator
         $lines[] = 'use Relay\\Table;';
         $lines[] = '';
         $lines[] = sprintf('// seed: %d (%s)', $options->seed, $options->seedSource);
-        $lines[] = sprintf('// ops: %d, workers: %d, keys: %d, mode: %s', $options->ops, $options->workers, $options->keys, $options->mode);
+        $lines[] = sprintf(
+            '// ops: %d, workers: %d, keys: %d, max-key-size: %d, max-mems: %d, mode: %s',
+            $options->ops,
+            $options->workers,
+            $options->keys,
+            $options->maxKeySize,
+            $options->maxMems,
+            $options->mode
+        );
         $lines[] = sprintf('// namespace: %s', $options->namespace);
         $lines[] = '';
         $lines[] = sprintf('$namespace = %s;', var_export($options->namespace, true));
@@ -47,7 +55,12 @@ final class ScriptGenerator
         $lines[] = '// queue mode command stream';
         mt_srand($options->seed);
         for ($i = 0; $i < $options->ops; $i++) {
-            $cmd = $this->generator->generate($options->opSet, $options->keys);
+            $cmd = $this->generator->generate(
+                $options->opSet,
+                $options->keys,
+                $options->maxKeySize,
+                $options->maxMems
+            );
             $lines[] = $this->commandToPhp($cmd);
         }
     }
@@ -59,7 +72,12 @@ final class ScriptGenerator
             $lines[] = sprintf('// worker %d sequence', $workerId);
             mt_srand($options->seed + $workerId);
             for ($i = 0; $i < $options->ops; $i++) {
-                $cmd = $this->generator->generate($options->opSet, $options->keys);
+                $cmd = $this->generator->generate(
+                    $options->opSet,
+                    $options->keys,
+                    $options->maxKeySize,
+                    $options->maxMems
+                );
                 $lines[] = $this->commandToPhp($cmd);
             }
             $lines[] = '';

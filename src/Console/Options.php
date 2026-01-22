@@ -11,6 +11,8 @@ final class Options
         public readonly int $ops,
         public readonly int $seed,
         public readonly int $keys,
+        public readonly int $maxKeySize,
+        public readonly int $maxMems,
         public readonly string $mode,
         public readonly string $redisSpec,
         public readonly string $listName,
