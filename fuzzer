@@ -21,13 +21,14 @@ Usage:
   ./fuzzer --ops N [--workers N] [--seed INT] [--keys N]
            [--include csl] [--exclude csl]
            [--mode random|queue] [--redis host:port] [--list name]
-           [--log-level level]
+           [--log-level level] [--status-interval SECONDS]
 
 Notes:
   - If --seed is omitted, hrtime(true) is used.
   - If --workers=0, no fork is performed.
   - --mode=queue uses Redis; parent enqueues commands to a list and children pop.
   - --log-level accepts Monolog/PSR-3 levels (debug, info, notice, warning, error, critical, alert, emergency).
+  - --status-interval controls how often human-readable progress is printed (default: 1).
 
 TXT;
     fwrite(STDERR, $msg);
@@ -175,10 +176,35 @@ function execute_command(Table $table, array $cmd, Logger $logger, int $workerId
     }
 }
 
-function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array $opSet, string $namespace, Logger $logger): void
+function print_status(string $message): void
+{
+    fwrite(STDOUT, $message . "\n");
+}
+
+function format_percent(int $done, int $total): float
+{
+    if ($total <= 0) {
+        return 0.0;
+    }
+    return min(100.0, ($done / $total) * 100.0);
+}
+
+function run_random_worker(
+    int $workerId,
+    int $seed,
+    int $ops,
+    int $keys,
+    array $opSet,
+    string $namespace,
+    Logger $logger,
+    float $statusInterval
+): void
 {
     mt_srand($seed + $workerId);
     $table = new Table($namespace);
+    $start = microtime(true);
+    $lastReport = $start;
+    $executed = 0;
 
     for ($i = 0; $i < $ops; $i++) {
         $cmd = generate_command($opSet, $keys);
@@ -187,7 +213,31 @@ function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array 
         } catch (Throwable $e) {
             fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
         }
+        $executed++;
+        $now = microtime(true);
+        if ($statusInterval > 0 && ($now - $lastReport) >= $statusInterval) {
+            $percent = format_percent($executed, $ops);
+            print_status(sprintf(
+                'worker %d: %0.2f%% %d/%d commands executed',
+                $workerId,
+                $percent,
+                $executed,
+                $ops
+            ));
+            $lastReport = $now;
+        }
     }
+
+    $elapsed = microtime(true) - $start;
+    $rate = $elapsed > 0 ? ($executed / $elapsed) : 0.0;
+    print_status(sprintf(
+        'worker %d done: %d commands in %0.2fs (%0.1f ops/s)',
+        $workerId,
+        $executed,
+        $elapsed,
+        $rate
+    ));
+}
 }
 
 function parse_host_port(string $spec): array
@@ -209,6 +259,7 @@ $options = getopt('', [
     'redis::',
     'list::',
     'log-level::',
+    'status-interval::',
     'help::',
 ]);
 
@@ -225,6 +276,7 @@ $mode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'rando
 $redisSpec = isset($options['redis']) ? (string) $options['redis'] : '127.0.0.1:6379';
 $listName = isset($options['list']) ? (string) $options['list'] : 'relay-table-fuzzer';
 $logLevel = isset($options['log-level']) ? strtolower((string) $options['log-level']) : 'info';
+$statusInterval = isset($options['status-interval']) ? (float) $options['status-interval'] : 1.0;
 
 try {
     $logger = create_logger($logLevel);
@@ -233,8 +285,8 @@ try {
     exit(1);
 }
 
-if ($ops <= 0 || $keys <= 0 || $workers < 0) {
-    fwrite(STDERR, "Invalid --ops, --keys, or --workers value.\n");
+if ($ops <= 0 || $keys <= 0 || $workers < 0 || $statusInterval <= 0) {
+    fwrite(STDERR, "Invalid --ops, --keys, --workers, or --status-interval value.\n");
     exit(1);
 }
 
@@ -286,6 +338,10 @@ if ($mode === 'queue') {
     $rerunParts[] = '--list';
     $rerunParts[] = $listName;
 }
+if (isset($options['status-interval'])) {
+    $rerunParts[] = '--status-interval';
+    $rerunParts[] = (string) $statusInterval;
+}
 $rerunCommand = implode(' ', array_map('escapeshellarg', $rerunParts));
 
 $logger->info('Fuzzer run configuration', [
@@ -301,8 +357,30 @@ $logger->info('Fuzzer run configuration', [
     'op_set' => $opSet,
     'redis' => $redisSpec,
     'list' => $listName,
+    'status_interval' => $statusInterval,
     'rerun' => $rerunCommand,
 ]);
+
+print_status('Relay Table fuzzer starting');
+print_status(sprintf('ops: %d', $ops));
+print_status(sprintf('workers: %d', $workers));
+print_status(sprintf('mode: %s', $mode));
+print_status(sprintf('seed: %d (%s)', $seed, $seedSource));
+print_status(sprintf('keys: %d', $keys));
+print_status(sprintf('namespace: %s', $namespace));
+if ($include !== []) {
+    print_status(sprintf('include: %s', implode(',', $include)));
+}
+if ($exclude !== []) {
+    print_status(sprintf('exclude: %s', implode(',', $exclude)));
+}
+print_status(sprintf('status interval: %0.2fs', $statusInterval));
+if ($mode === 'queue') {
+    print_status(sprintf('redis: %s', $redisSpec));
+    print_status(sprintf('list: %s', $listName));
+}
+print_status(sprintf('op set: %s', implode(',', $opSet)));
+print_status(sprintf('rerun: %s', $rerunCommand));
 
 if ($mode === 'queue') {
     if (!class_exists('Redis')) {
@@ -327,6 +405,9 @@ if ($mode === 'queue') {
 
     if ($workers === 0) {
         $table = new Table($namespace);
+        $start = microtime(true);
+        $lastReport = $start;
+        $executed = 0;
         while (true) {
             $payload = $redis->lPop($queueName);
             if ($payload === false) {
@@ -341,7 +422,27 @@ if ($mode === 'queue') {
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker 0 error: {$e->getMessage()}\n");
             }
+            $executed++;
+            $now = microtime(true);
+            if ($statusInterval > 0 && ($now - $lastReport) >= $statusInterval) {
+                $percent = format_percent($executed, $ops);
+                print_status(sprintf(
+                    'worker 0: %0.2f%% %d/%d commands executed',
+                    $percent,
+                    $executed,
+                    $ops
+                ));
+                $lastReport = $now;
+            }
         }
+        $elapsed = microtime(true) - $start;
+        $rate = $elapsed > 0 ? ($executed / $elapsed) : 0.0;
+        print_status(sprintf(
+            'worker 0 done: %d commands in %0.2fs (%0.1f ops/s)',
+            $executed,
+            $elapsed,
+            $rate
+        ));
         exit(0);
     }
 
@@ -359,6 +460,9 @@ if ($mode === 'queue') {
         }
         if ($pid === 0) {
             $table = new Table($namespace);
+            $start = microtime(true);
+            $lastReport = $start;
+            $executed = 0;
             while (true) {
                 $payload = $redis->lPop($queueName);
                 if ($payload === false) {
@@ -373,7 +477,29 @@ if ($mode === 'queue') {
                 } catch (Throwable $e) {
                     fwrite(STDERR, "worker {$i} error: {$e->getMessage()}\n");
                 }
+                $executed++;
+                $now = microtime(true);
+                if ($statusInterval > 0 && ($now - $lastReport) >= $statusInterval) {
+                    $percent = format_percent($executed, $ops);
+                    print_status(sprintf(
+                        'worker %d: %0.2f%% %d/%d commands executed',
+                        $i,
+                        $percent,
+                        $executed,
+                        $ops
+                    ));
+                    $lastReport = $now;
+                }
             }
+            $elapsed = microtime(true) - $start;
+            $rate = $elapsed > 0 ? ($executed / $elapsed) : 0.0;
+            print_status(sprintf(
+                'worker %d done: %d commands in %0.2fs (%0.1f ops/s)',
+                $i,
+                $executed,
+                $elapsed,
+                $rate
+            ));
             exit(0);
         }
         $pids[] = $pid;
@@ -383,6 +509,7 @@ if ($mode === 'queue') {
         pcntl_waitpid($pid, $status);
     }
 
+    print_status('All workers completed.');
     exit(0);
 }
 
@@ -392,7 +519,7 @@ if ($mode !== 'random') {
 }
 
 if ($workers === 0) {
-    run_random_worker(0, $seed, $ops, $keys, $opSet, $namespace, $logger);
+    run_random_worker(0, $seed, $ops, $keys, $opSet, $namespace, $logger, $statusInterval);
     exit(0);
 }
 
@@ -409,7 +536,7 @@ for ($i = 0; $i < $workers; $i++) {
         exit(1);
     }
     if ($pid === 0) {
-        run_random_worker($i, $seed, $ops, $keys, $opSet, $namespace, $logger);
+        run_random_worker($i, $seed, $ops, $keys, $opSet, $namespace, $logger, $statusInterval);
         exit(0);
     }
     $pids[] = $pid;
@@ -419,4 +546,5 @@ foreach ($pids as $pid) {
     pcntl_waitpid($pid, $status);
 }
 
+print_status('All workers completed.');
 exit(0);
