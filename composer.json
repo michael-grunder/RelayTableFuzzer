@@ -5,6 +5,10 @@
             "Mgrunder\\RelayTableFuzzer\\": "src/"
         }
     },
+    "bin": [
+        "bin/fuzzer",
+        "bin/fuzzer-generate"
+    ],
     "authors": [
         {
             "name": "michael-grunder",

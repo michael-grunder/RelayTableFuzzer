@@ -1,0 +1,44 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Mgrunder\RelayTableFuzzer\CommandGenerator;
+use Mgrunder\RelayTableFuzzer\Console\OptionParser;
+use Mgrunder\RelayTableFuzzer\Console\Usage;
+use Mgrunder\RelayTableFuzzer\ScriptGenerator;
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+$options = getopt('', [
+    'workers::',
+    'seed::',
+    'ops:',
+    'keys::',
+    'include::',
+    'exclude::',
+    'mode::',
+    'help::',
+]);
+
+if (isset($options['help']) || !isset($options['ops'])) {
+    fwrite(STDERR, Usage::generator());
+    exit(isset($options['ops']) ? 0 : 1);
+}
+
+try {
+    $parsed = OptionParser::parse($options, $argv[0]);
+} catch (RuntimeException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
+$generator = new ScriptGenerator(new CommandGenerator());
+try {
+    $script = $generator->generate($parsed);
+} catch (RuntimeException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
+fwrite(STDOUT, $script);

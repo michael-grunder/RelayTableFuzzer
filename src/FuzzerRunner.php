@@ -1,0 +1,265 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Mgrunder\RelayTableFuzzer;
+
+use Mgrunder\RelayTableFuzzer\Console\Options;
+use Monolog\Logger;
+use Relay\Table;
+use Throwable;
+
+final class FuzzerRunner
+{
+    public function __construct(
+        private readonly CommandGenerator $generator
+    ) {
+    }
+
+    public function run(Options $options, Logger $logger): void
+    {
+        if ($options->mode === 'queue') {
+            $this->runQueueMode($options, $logger);
+            return;
+        }
+
+        if ($options->mode !== 'random') {
+            throw new \RuntimeException("Unknown --mode: {$options->mode}. Use random or queue.");
+        }
+
+        $this->runRandomMode($options, $logger);
+    }
+
+    private function runRandomMode(Options $options, Logger $logger): void
+    {
+        if ($options->workers === 0) {
+            $this->runRandomWorker(0, $options, $logger);
+            return;
+        }
+
+        if (!function_exists('pcntl_fork')) {
+            throw new \RuntimeException('pcntl extension is required for workers > 0.');
+        }
+
+        $pids = [];
+        for ($i = 0; $i < $options->workers; $i++) {
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                throw new \RuntimeException("Failed to fork worker {$i}.");
+            }
+            if ($pid === 0) {
+                $this->runRandomWorker($i, $options, $logger);
+                exit(0);
+            }
+            $pids[] = $pid;
+        }
+
+        foreach ($pids as $pid) {
+            pcntl_waitpid($pid, $status);
+        }
+
+        $this->printStatus('All workers completed.');
+    }
+
+    private function runRandomWorker(int $workerId, Options $options, Logger $logger): void
+    {
+        mt_srand($options->seed + $workerId);
+        $table = new Table($options->namespace);
+        $start = microtime(true);
+        $lastReport = $start;
+        $executed = 0;
+
+        for ($i = 0; $i < $options->ops; $i++) {
+            $cmd = $this->generator->generate($options->opSet, $options->keys);
+            try {
+                $this->executeCommand($table, $cmd, $logger, $workerId);
+            } catch (Throwable $e) {
+                fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
+            }
+            $executed++;
+            $now = microtime(true);
+            if ($options->statusInterval > 0 && ($now - $lastReport) >= $options->statusInterval) {
+                $percent = $this->formatPercent($executed, $options->ops);
+                $this->printStatus(sprintf(
+                    'worker %d: %0.2f%% %d/%d commands executed',
+                    $workerId,
+                    $percent,
+                    $executed,
+                    $options->ops
+                ));
+                $lastReport = $now;
+            }
+        }
+
+        $elapsed = microtime(true) - $start;
+        $rate = $elapsed > 0 ? ($executed / $elapsed) : 0.0;
+        $this->printStatus(sprintf(
+            'worker %d done: %d commands in %0.2fs (%0.1f ops/s)',
+            $workerId,
+            $executed,
+            $elapsed,
+            $rate
+        ));
+    }
+
+    private function runQueueMode(Options $options, Logger $logger): void
+    {
+        if (!class_exists('Redis')) {
+            throw new \RuntimeException('Redis extension is required for --mode=queue.');
+        }
+
+        [$host, $port] = $this->parseHostPort($options->redisSpec);
+        $redis = new \Redis();
+        if (!$redis->connect($host, $port, 2.5)) {
+            throw new \RuntimeException("Failed to connect to Redis at {$host}:{$port}.");
+        }
+
+        $queueName = $options->listName . ':' . $options->seed;
+
+        mt_srand($options->seed);
+        for ($i = 0; $i < $options->ops; $i++) {
+            $cmd = $this->generator->generate($options->opSet, $options->keys);
+            $redis->rPush($queueName, json_encode($cmd, JSON_UNESCAPED_SLASHES));
+        }
+
+        if ($options->workers === 0) {
+            $this->runQueueConsumer($redis, $queueName, 0, $options, $logger);
+            return;
+        }
+
+        if (!function_exists('pcntl_fork')) {
+            throw new \RuntimeException('pcntl extension is required for workers > 0.');
+        }
+
+        $pids = [];
+        for ($i = 0; $i < $options->workers; $i++) {
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                throw new \RuntimeException("Failed to fork worker {$i}.");
+            }
+            if ($pid === 0) {
+                $this->runQueueConsumer($redis, $queueName, $i, $options, $logger);
+                exit(0);
+            }
+            $pids[] = $pid;
+        }
+
+        foreach ($pids as $pid) {
+            pcntl_waitpid($pid, $status);
+        }
+
+        $this->printStatus('All workers completed.');
+    }
+
+    private function runQueueConsumer(\Redis $redis, string $queueName, int $workerId, Options $options, Logger $logger): void
+    {
+        $table = new Table($options->namespace);
+        $start = microtime(true);
+        $lastReport = $start;
+        $executed = 0;
+
+        while (true) {
+            $payload = $redis->lPop($queueName);
+            if ($payload === false) {
+                break;
+            }
+            $cmd = json_decode($payload, true);
+            if (!is_array($cmd)) {
+                continue;
+            }
+            try {
+                $this->executeCommand($table, $cmd, $logger, $workerId);
+            } catch (Throwable $e) {
+                fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
+            }
+            $executed++;
+            $now = microtime(true);
+            if ($options->statusInterval > 0 && ($now - $lastReport) >= $options->statusInterval) {
+                $percent = $this->formatPercent($executed, $options->ops);
+                $this->printStatus(sprintf(
+                    'worker %d: %0.2f%% %d/%d commands executed',
+                    $workerId,
+                    $percent,
+                    $executed,
+                    $options->ops
+                ));
+                $lastReport = $now;
+            }
+        }
+
+        $elapsed = microtime(true) - $start;
+        $rate = $elapsed > 0 ? ($executed / $elapsed) : 0.0;
+        $this->printStatus(sprintf(
+            'worker %d done: %d commands in %0.2fs (%0.1f ops/s)',
+            $workerId,
+            $executed,
+            $elapsed,
+            $rate
+        ));
+    }
+
+    private function executeCommand(Table $table, array $cmd, Logger $logger, int $workerId): void
+    {
+        $op = $cmd['op'] ?? '';
+        $logger->debug('Executing command', [
+            'worker' => $workerId,
+            'cmd' => $cmd,
+        ]);
+
+        switch ($op) {
+            case 'get':
+                $table->get((string) $cmd['key']);
+                break;
+            case 'pluck':
+                $table->pluck((string) $cmd['key'], (string) $cmd['field']);
+                break;
+            case 'set':
+                $table->set((string) $cmd['key'], $cmd['value'] ?? null);
+                break;
+            case 'exists':
+                $table->exists((string) $cmd['key']);
+                break;
+            case 'delete':
+                $table->delete((string) $cmd['key']);
+                break;
+            case 'count':
+                $table->count();
+                break;
+            case 'namespace':
+                $table->namespace();
+                break;
+            case 'clear':
+                $table->clear();
+                break;
+            case 'namespaces':
+                Table::namespaces();
+                break;
+            case 'clearAll':
+                Table::clearAll();
+                break;
+            default:
+                break;
+        }
+    }
+
+    private function printStatus(string $message): void
+    {
+        fwrite(STDOUT, $message . "\n");
+    }
+
+    private function formatPercent(int $done, int $total): float
+    {
+        if ($total <= 0) {
+            return 0.0;
+        }
+        return min(100.0, ($done / $total) * 100.0);
+    }
+
+    private function parseHostPort(string $spec): array
+    {
+        $parts = explode(':', $spec, 2);
+        $host = $parts[0] !== '' ? $parts[0] : '127.0.0.1';
+        $port = isset($parts[1]) && $parts[1] !== '' ? (int) $parts[1] : 6379;
+        return [$host, $port];
+    }
+}

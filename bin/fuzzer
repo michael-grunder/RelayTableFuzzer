@@ -1,0 +1,93 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Mgrunder\RelayTableFuzzer\CommandGenerator;
+use Mgrunder\RelayTableFuzzer\Console\OptionParser;
+use Mgrunder\RelayTableFuzzer\Console\Usage;
+use Mgrunder\RelayTableFuzzer\FuzzerRunner;
+use Mgrunder\RelayTableFuzzer\LoggerFactory;
+use Psr\Log\InvalidArgumentException;
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+$options = getopt('', [
+    'workers::',
+    'seed::',
+    'ops:',
+    'keys::',
+    'include::',
+    'exclude::',
+    'mode::',
+    'redis::',
+    'list::',
+    'log-level::',
+    'status-interval::',
+    'help::',
+]);
+
+if (isset($options['help']) || !isset($options['ops'])) {
+    fwrite(STDERR, Usage::fuzzer());
+    exit(isset($options['ops']) ? 0 : 1);
+}
+
+try {
+    $parsed = OptionParser::parse($options, $argv[0]);
+} catch (RuntimeException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
+try {
+    $logger = LoggerFactory::create($parsed->logLevel);
+} catch (InvalidArgumentException $e) {
+    fwrite(STDERR, "Invalid --log-level: {$parsed->logLevel}\n");
+    exit(1);
+}
+
+$logger->info('Fuzzer run configuration', [
+    'mode' => $parsed->mode,
+    'ops' => $parsed->ops,
+    'seed' => $parsed->seed,
+    'seed_source' => $parsed->seedSource,
+    'workers' => $parsed->workers,
+    'keys' => $parsed->keys,
+    'namespace' => $parsed->namespace,
+    'include' => $parsed->include,
+    'exclude' => $parsed->exclude,
+    'op_set' => $parsed->opSet,
+    'redis' => $parsed->redisSpec,
+    'list' => $parsed->listName,
+    'status_interval' => $parsed->statusInterval,
+    'rerun' => $parsed->rerunCommand,
+]);
+
+fwrite(STDOUT, "Relay Table fuzzer starting\n");
+fwrite(STDOUT, sprintf('ops: %d\n', $parsed->ops));
+fwrite(STDOUT, sprintf('workers: %d\n', $parsed->workers));
+fwrite(STDOUT, sprintf('mode: %s\n', $parsed->mode));
+fwrite(STDOUT, sprintf('seed: %d (%s)\n', $parsed->seed, $parsed->seedSource));
+fwrite(STDOUT, sprintf('keys: %d\n', $parsed->keys));
+fwrite(STDOUT, sprintf('namespace: %s\n', $parsed->namespace));
+if ($parsed->include !== []) {
+    fwrite(STDOUT, sprintf('include: %s\n', implode(',', $parsed->include)));
+}
+if ($parsed->exclude !== []) {
+    fwrite(STDOUT, sprintf('exclude: %s\n', implode(',', $parsed->exclude)));
+}
+fwrite(STDOUT, sprintf('status interval: %0.2fs\n', $parsed->statusInterval));
+if ($parsed->mode === 'queue') {
+    fwrite(STDOUT, sprintf('redis: %s\n', $parsed->redisSpec));
+    fwrite(STDOUT, sprintf('list: %s\n', $parsed->listName));
+}
+fwrite(STDOUT, sprintf('op set: %s\n', implode(',', $parsed->opSet)));
+fwrite(STDOUT, sprintf('rerun: %s\n', $parsed->rerunCommand));
+
+$runner = new FuzzerRunner(new CommandGenerator());
+try {
+    $runner->run($parsed, $logger);
+} catch (RuntimeException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
