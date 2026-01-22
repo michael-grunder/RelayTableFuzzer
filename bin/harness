@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--jobs N] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -164,14 +164,15 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $title = 'relay-table-fuzzer harness';
     $lines[] = pad_line(str_pad($title, $width, ' ', STR_PAD_BOTH), $width);
     $lines[] = str_repeat('-', $width);
+    $activeJobs = $stats['active_jobs'] ?? 1;
     $lines[] = two_column("Elapsed: {$elapsed}", 'Runs: ' . number_format($stats['runs']), $width);
-    $lines[] = two_column('Reproducers: ' . number_format($stats['reproducers']), "Last failure: {$sinceFailure}", $width);
+    $lines[] = two_column("Jobs: {$activeJobs}", 'Reproducers: ' . number_format($stats['reproducers']), $width);
+    $lines[] = two_column("Last failure: {$sinceFailure}", 'Reductions: ' . number_format($stats['reductions']), $width);
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
-    $lines[] = two_column("Ops: {$opsLabel}", 'Reductions: ' . number_format($stats['reductions']), $width);
+    $lines[] = two_column("Ops: {$opsLabel}", "Mode: {$mode}", $width);
     $lastFailure = $stats['last_failure_summary'] !== '' ? $stats['last_failure_summary'] : 'none';
-    $lines[] = two_column("Mode: {$mode}", "Last crash: {$lastFailure}", $width);
     $event = $stats['last_event'] !== '' ? $stats['last_event'] : 'none';
-    $lines[] = pad_line("Event: {$event}", $width);
+    $lines[] = two_column("Last crash: {$lastFailure}", "Event: {$event}", $width);
     $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
     $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
     $lines[] = str_repeat('-', $width);
@@ -264,6 +265,132 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
         'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
         'stderr_path' => $stderrPath !== false ? $stderrPath : null,
     ];
+}
+
+function start_command(array $fullCommand, string $phpBin): array
+{
+    $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
+    $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
+    $descriptorSpec = [
+        0 => ['file', 'php://stdin', 'r'],
+        1 => ['file', $stdoutPath !== false ? $stdoutPath : 'php://stdout', 'w'],
+        2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
+    ];
+
+    $process = proc_open($fullCommand, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        fwrite(STDERR, "Failed to start process\n");
+        exit(1);
+    }
+
+    $status = proc_get_status($process);
+
+    return [
+        'process' => $process,
+        'pid' => $status['pid'] ?? null,
+        'start_time' => microtime(true),
+        'php_bin' => $phpBin,
+        'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
+        'stderr_path' => $stderrPath !== false ? $stderrPath : null,
+        'timed_out' => false,
+        'cancelled' => false,
+    ];
+}
+
+function finalize_command(array $job, array $status): array
+{
+    $exitCode = proc_close($job['process']);
+    $signal = null;
+    if (($status['signaled'] ?? false) && isset($status['termsig'])) {
+        $signal = (int)$status['termsig'];
+    } elseif ($exitCode !== 0 && $exitCode > 128) {
+        $signal = $exitCode - 128;
+    }
+
+    $coreFiles = find_core_dumps($job['php_bin'], $job['pid']);
+    $isCrash = $job['timed_out'] || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
+
+    return [
+        'exit_code' => $exitCode,
+        'signal' => $signal,
+        'pid' => $job['pid'],
+        'timed_out' => $job['timed_out'],
+        'is_crash' => $isCrash,
+        'core_files' => $coreFiles,
+        'stdout_path' => $job['stdout_path'],
+        'stderr_path' => $job['stderr_path'],
+    ];
+}
+
+function poll_command(array &$job, ?int $maxSeconds): ?array
+{
+    $status = proc_get_status($job['process']);
+    if ($status['running']) {
+        if (!empty($job['cancelled'])) {
+            proc_terminate($job['process']);
+            $cancelAt = $job['cancel_requested_at'] ?? $job['start_time'];
+            if ((microtime(true) - $cancelAt) >= 1.0) {
+                proc_terminate($job['process'], SIGKILL);
+            }
+            return null;
+        }
+
+        if ($maxSeconds !== null && (microtime(true) - $job['start_time']) >= $maxSeconds) {
+            $job['timed_out'] = true;
+            proc_terminate($job['process']);
+            usleep(100000);
+            $status = proc_get_status($job['process']);
+            if ($status['running']) {
+                proc_terminate($job['process'], SIGKILL);
+            }
+        } else {
+            return null;
+        }
+    }
+
+    if ($status['running']) {
+        for ($i = 0; $i < 10; $i++) {
+            usleep(100000);
+            $status = proc_get_status($job['process']);
+            if (!$status['running']) {
+                break;
+            }
+        }
+    }
+
+    return finalize_command($job, $status);
+}
+
+function cancel_command(array &$job): void
+{
+    if ($job['cancelled']) {
+        return;
+    }
+
+    $job['cancelled'] = true;
+    $job['cancel_requested_at'] = microtime(true);
+    proc_terminate($job['process']);
+}
+
+function create_job(
+    array $commandArgs,
+    ?int $currentOps,
+    string $phpBin,
+    ?string $phpIni,
+    int $jobId
+): array {
+    $dynamicArgs = array_map('replace_dynamic', $commandArgs);
+    $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
+    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+
+    $job = start_command($fullCommand, $phpBin);
+    $job['id'] = $jobId;
+    $job['dynamic_args'] = $dynamicArgs;
+    $job['full_command'] = $fullCommand;
+    $job['command_string'] = render_command($fullCommand);
+    $job['ops'] = $currentOps;
+
+    return $job;
 }
 
 function reduce_ops(
@@ -389,6 +516,7 @@ $phpIni = null;
 $ops = null;
 $reduce = false;
 $maxSeconds = null;
+$jobs = 1;
 $commandArgs = [];
 
 for ($i = 1; $i < $argc; $i++) {
@@ -427,6 +555,12 @@ for ($i = 1; $i < $argc; $i++) {
     if ($arg === '--max-seconds') {
         $maxSeconds = $argv[++$i] ?? null;
         $maxSeconds = is_numeric($maxSeconds) ? (int)$maxSeconds : null;
+        continue;
+    }
+
+    if ($arg === '--jobs') {
+        $jobs = $argv[++$i] ?? null;
+        $jobs = is_numeric($jobs) ? (int)$jobs : null;
         continue;
     }
 
@@ -479,6 +613,12 @@ if ($maxSeconds !== null && $maxSeconds <= 0) {
     exit(1);
 }
 
+if ($jobs === null || $jobs <= 0) {
+    fwrite(STDERR, "--jobs requires a positive integer\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 $reproducersDir = __DIR__ . '/../reproducers';
 if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
@@ -495,101 +635,164 @@ $stats = [
     'last_command' => '',
     'last_event' => '',
     'last_reproducer' => '',
+    'active_jobs' => 0,
 ];
 
+$jobCounter = 0;
+$runningJobs = [];
+$crashResult = null;
+$crashJob = null;
+$stopAfterCrash = false;
+
 while (true) {
-    $dynamicArgs = array_map('replace_dynamic', $commandArgs);
-    $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
-    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
-    $commandString = render_command($fullCommand);
+    $progress = false;
 
-    $result = run_command($fullCommand, $phpBin, $maxSeconds);
-    $stats['runs']++;
-    $stats['last_command'] = $commandString;
-    $stats['last_event'] = 'running';
-    if ($result['is_crash']) {
-        $stats['last_failure_time'] = microtime(true);
-        $stats['last_failure_summary'] = build_failure_summary($result);
-        $stats['last_event'] = 'crash detected';
-    }
-    render_screen($stats, $currentOps, 'fuzzing');
-    if (!$result['is_crash']) {
-        cleanup_output_files($result);
-        continue;
+    while (!$stopAfterCrash && count($runningJobs) < $jobs) {
+        $jobCounter++;
+        $job = create_job($commandArgs, $currentOps, $phpBin, $phpIni, $jobCounter);
+        $runningJobs[$job['id']] = $job;
+        $stats['last_command'] = $job['command_string'];
+        $stats['last_event'] = "spawned job {$job['id']}";
+        $progress = true;
     }
 
-    $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
-    $jobDir = $reproducersDir . '/' . $jobId;
-    mkdir($jobDir, 0777, true);
+    $stats['active_jobs'] = count($runningJobs);
 
-    $finalCommand = $commandString;
-    $finalOps = $currentOps;
-
-    if ($reduce && $currentOps !== null) {
-        $stats['reductions']++;
-        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir, $maxSeconds);
-        $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
-        $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
-
-        if ($finalCommand !== $commandString) {
-            file_put_contents($jobDir . '/command-original.txt', $commandString . "\n");
+    foreach ($runningJobs as $jobId => &$job) {
+        $result = poll_command($job, $maxSeconds);
+        if ($result === null) {
+            continue;
         }
-    }
 
-    file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+        $progress = true;
+        unset($runningJobs[$jobId]);
+        $stats['runs']++;
+        $stats['last_command'] = $job['command_string'];
+        $stats['last_event'] = "job {$jobId} finished";
 
-    $outputFiles = move_output_files($result, $jobDir);
-    cleanup_output_files($result);
-
-    $signal = $result['signal'];
-    $exitCode = $result['exit_code'];
-    $pid = $result['pid'];
-
-    $signalLabel = $signal !== null ? signal_label($signal) : 'none';
-    $signalDesc = $signal !== null ? signal_description($signal) : '';
-    $exitName = !empty($result['timed_out'])
-        ? 'TIMEOUT'
-        : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
-
-    $report = [
-        "command: {$finalCommand}",
-        "exit_code: {$exitCode}",
-        "exit_name: {$exitName}",
-        "signal: {$signalLabel}",
-    ];
-    if ($finalOps !== null) {
-        $report[] = "ops: {$finalOps}";
-    }
-    if ($signalDesc !== '') {
-        $report[] = "signal_desc: {$signalDesc}";
-    }
-    if (!empty($result['timed_out'])) {
-        $report[] = 'timed_out: yes';
-        if ($maxSeconds !== null) {
-            $report[] = "max_seconds: {$maxSeconds}";
+        if ($job['cancelled']) {
+            cleanup_output_files($result);
+            continue;
         }
+
+        if ($result['is_crash'] && $crashResult === null) {
+            $crashResult = $result;
+            $crashJob = $job;
+            $stats['last_failure_time'] = microtime(true);
+            $stats['last_failure_summary'] = build_failure_summary($result);
+            $stats['last_event'] = 'crash detected';
+            $stopAfterCrash = true;
+
+            foreach ($runningJobs as &$pendingJob) {
+                cancel_command($pendingJob);
+            }
+        } else {
+            cleanup_output_files($result);
+        }
+
+        $stats['active_jobs'] = count($runningJobs);
+        render_screen($stats, $currentOps, $stopAfterCrash ? 'reducing' : 'fuzzing');
     }
-    $report[] = "pid: " . ($pid ?? 'unknown');
-    if (!empty($result['core_files'])) {
-        $report[] = 'core_files: ' . implode(', ', array_map('basename', $result['core_files']));
+    unset($job);
+
+    if ($crashResult !== null && $runningJobs === []) {
+        $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
+        $jobDir = $reproducersDir . '/' . $jobId;
+        mkdir($jobDir, 0777, true);
+
+        $finalCommand = $crashJob['command_string'];
+        $finalOps = $currentOps;
+        $dynamicArgs = $crashJob['dynamic_args'];
+
+        if ($reduce && $currentOps !== null) {
+            $stats['reductions']++;
+            $stats['active_jobs'] = 1;
+            $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir, $maxSeconds);
+            $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
+            $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
+
+            if ($finalCommand !== $crashJob['command_string']) {
+                file_put_contents($jobDir . '/command-original.txt', $crashJob['command_string'] . "\n");
+            }
+        }
+
+        file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+
+        $outputFiles = move_output_files($crashResult, $jobDir);
+        cleanup_output_files($crashResult);
+
+        $signal = $crashResult['signal'];
+        $exitCode = $crashResult['exit_code'];
+        $pid = $crashResult['pid'];
+
+        $signalLabel = $signal !== null ? signal_label($signal) : 'none';
+        $signalDesc = $signal !== null ? signal_description($signal) : '';
+        $exitName = !empty($crashResult['timed_out'])
+            ? 'TIMEOUT'
+            : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
+
+        $reportData = [
+            'command' => $finalCommand,
+            'exit_code' => $exitCode,
+            'exit_name' => $exitName,
+            'signal' => $signalLabel,
+        ];
+        if ($finalOps !== null) {
+            $reportData['ops'] = $finalOps;
+        }
+        if ($signalDesc !== '') {
+            $reportData['signal_desc'] = $signalDesc;
+        }
+        if (!empty($crashResult['timed_out'])) {
+            $reportData['timed_out'] = true;
+            if ($maxSeconds !== null) {
+                $reportData['max_seconds'] = $maxSeconds;
+            }
+        }
+        $reportData['pid'] = $pid ?? 'unknown';
+        if (!empty($crashResult['core_files'])) {
+            $reportData['core_files'] = array_map('basename', $crashResult['core_files']);
+        }
+        if ($outputFiles !== []) {
+            $reportData['output_files'] = $outputFiles;
+        }
+
+        $report = [];
+        foreach ($reportData as $key => $value) {
+            if (is_array($value)) {
+                $value = implode(', ', $value);
+            } elseif (is_bool($value)) {
+                $value = $value ? 'yes' : 'no';
+            }
+            $report[] = "{$key}: {$value}";
+        }
+
+        file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
+        file_put_contents(
+            $jobDir . '/report.json',
+            json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+        );
+
+        move_core_dumps($crashResult['core_files'], $jobDir);
+
+        $stats['reproducers']++;
+        $stats['last_event'] = "reproducer saved: {$jobDir}";
+        $stats['last_reproducer'] = $jobDir;
+        $stats['active_jobs'] = 0;
+        render_screen($stats, $currentOps, $reduce ? 'reducing' : 'fuzzing');
+
+        if ($reduce && $finalOps !== null) {
+            $currentOps = $finalOps;
+            $crashResult = null;
+            $crashJob = null;
+            $stopAfterCrash = false;
+            continue;
+        }
+
+        exit(1);
     }
-    if ($outputFiles !== []) {
-        $report[] = 'output_files: ' . implode(', ', $outputFiles);
+
+    if (!$progress) {
+        usleep(10000);
     }
-
-    file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
-
-    move_core_dumps($result['core_files'], $jobDir);
-
-    $stats['reproducers']++;
-    $stats['last_event'] = "reproducer saved: {$jobDir}";
-    $stats['last_reproducer'] = $jobDir;
-    render_screen($stats, $currentOps, $reduce ? 'reducing' : 'fuzzing');
-
-    if ($reduce && $finalOps !== null) {
-        $currentOps = $finalOps;
-        continue;
-    }
-
-    exit(1);
 }

@@ -1,0 +1,161 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+$sortKey = 'ops';
+$reproducersDir = null;
+
+foreach (array_slice($argv, 1) as $arg) {
+    if ($arg === '-h' || $arg === '--help') {
+        fwrite(STDOUT, "Usage: reprodcuers [path] [--sort=ops|mtime|name]\n");
+        exit(0);
+    }
+    if (str_starts_with($arg, '--sort=')) {
+        $sortKey = substr($arg, strlen('--sort='));
+        continue;
+    }
+    if ($reproducersDir === null) {
+        $reproducersDir = $arg;
+    }
+}
+
+$reproducersDir ??= __DIR__ . '/../reproducers';
+$reproducersDir = rtrim($reproducersDir, '/');
+
+if (!is_dir($reproducersDir)) {
+    fwrite(STDERR, "reproducers directory not found: {$reproducersDir}\n");
+    exit(1);
+}
+
+$rows = [];
+$entries = scandir($reproducersDir);
+if ($entries === false) {
+    fwrite(STDERR, "failed to scan: {$reproducersDir}\n");
+    exit(1);
+}
+
+foreach ($entries as $entry) {
+    if ($entry === '.' || $entry === '..') {
+        continue;
+    }
+    $dir = $reproducersDir . '/' . $entry;
+    if (!is_dir($dir)) {
+        continue;
+    }
+
+    $report = load_report($dir);
+    $rows[] = [
+        'name' => $entry,
+        'dir' => $dir,
+        'mtime' => filemtime($dir) ?: 0,
+        'ops' => $report['ops'] ?? null,
+        'exit_name' => $report['exit_name'] ?? '',
+        'timed_out' => !empty($report['timed_out']),
+        'command' => $report['command'] ?? '',
+        'core_files' => $report['core_files'] ?? [],
+        'output_files' => $report['output_files'] ?? [],
+    ];
+}
+
+if ($rows === []) {
+    fwrite(STDOUT, "no reproducers found in {$reproducersDir}\n");
+    exit(0);
+}
+
+usort($rows, static function (array $a, array $b) use ($sortKey): int {
+    if ($sortKey === 'mtime') {
+        $cmp = $a['mtime'] <=> $b['mtime'];
+        return $cmp !== 0 ? $cmp : strcmp($a['name'], $b['name']);
+    }
+    if ($sortKey === 'name') {
+        return strcmp($a['name'], $b['name']);
+    }
+    $aOps = $a['ops'];
+    $bOps = $b['ops'];
+    if ($aOps === null && $bOps === null) {
+        return strcmp($a['name'], $b['name']);
+    }
+    if ($aOps === null) {
+        return 1;
+    }
+    if ($bOps === null) {
+        return -1;
+    }
+    $cmp = $aOps <=> $bOps;
+    return $cmp !== 0 ? $cmp : strcmp($a['name'], $b['name']);
+});
+
+$opsWidth = 3;
+$exitWidth = 9;
+foreach ($rows as $row) {
+    $opsLabel = $row['ops'] !== null ? (string)$row['ops'] : '-';
+    $opsWidth = max($opsWidth, strlen($opsLabel));
+    $exitWidth = max($exitWidth, strlen($row['exit_name']));
+}
+
+foreach ($rows as $row) {
+    $opsLabel = $row['ops'] !== null ? (string)$row['ops'] : '-';
+    $exitLabel = $row['exit_name'] !== '' ? $row['exit_name'] : '-';
+    $timeoutLabel = $row['timed_out'] ? 'yes' : 'no';
+    printf("%{$opsWidth}s  %-{$exitWidth}s  %-3s  %s\n", $opsLabel, $exitLabel, $timeoutLabel, $row['name']);
+    if ($row['command'] !== '') {
+        fwrite(STDOUT, "  cmd: {$row['command']}\n");
+    }
+    if ($row['output_files'] !== []) {
+        $files = is_array($row['output_files']) ? implode(', ', $row['output_files']) : (string)$row['output_files'];
+        fwrite(STDOUT, "  outputs: {$files}\n");
+    }
+    if ($row['core_files'] !== []) {
+        $files = is_array($row['core_files']) ? implode(', ', $row['core_files']) : (string)$row['core_files'];
+        fwrite(STDOUT, "  cores: {$files}\n");
+    }
+    fwrite(STDOUT, "\n");
+}
+
+function load_report(string $dir): array
+{
+    $jsonPath = $dir . '/report.json';
+    if (is_file($jsonPath)) {
+        $raw = file_get_contents($jsonPath);
+        if ($raw !== false) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+    }
+
+    $txtPath = $dir . '/report.txt';
+    if (!is_file($txtPath)) {
+        return [];
+    }
+
+    $report = [];
+    $lines = file($txtPath, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return [];
+    }
+    foreach ($lines as $line) {
+        $parts = explode(': ', $line, 2);
+        if (count($parts) !== 2) {
+            continue;
+        }
+        [$key, $value] = $parts;
+        if ($key === 'ops') {
+            $report[$key] = (int)$value;
+            continue;
+        }
+        if ($key === 'timed_out') {
+            $report[$key] = $value === 'yes';
+            continue;
+        }
+        if ($key === 'core_files' || $key === 'output_files') {
+            $report[$key] = $value === '' ? [] : array_map('trim', explode(',', $value));
+            continue;
+        }
+        $report[$key] = $value;
+    }
+
+    return $report;
+}
