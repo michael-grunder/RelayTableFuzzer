@@ -11,14 +11,14 @@ use Mgrunder\RelayTableFuzzer\ScriptGenerator;
 require_once __DIR__ . '/../vendor/autoload.php';
 
 $options = getopt('', [
-    'workers::',
-    'seed::',
+    'workers:',
+    'seed:',
     'ops:',
-    'keys::',
-    'include::',
-    'exclude::',
-    'mode::',
-    'help::',
+    'keys:',
+    'include:',
+    'exclude:',
+    'mode:',
+    'help',
 ]);
 
 if (isset($options['help']) || !isset($options['ops'])) {

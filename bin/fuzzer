@@ -13,18 +13,18 @@ use Psr\Log\InvalidArgumentException;
 require_once __DIR__ . '/../vendor/autoload.php';
 
 $options = getopt('', [
-    'workers::',
-    'seed::',
+    'workers:',
+    'seed:',
     'ops:',
-    'keys::',
-    'include::',
-    'exclude::',
-    'mode::',
-    'redis::',
-    'list::',
-    'log-level::',
-    'status-interval::',
-    'help::',
+    'keys:',
+    'include:',
+    'exclude:',
+    'mode:',
+    'redis:',
+    'list:',
+    'log-level:',
+    'status-interval:',
+    'help',
 ]);
 
 if (isset($options['help']) || !isset($options['ops'])) {
