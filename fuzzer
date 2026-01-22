@@ -46,7 +46,7 @@ function create_logger(string $level): Logger
 {
     $logger = new Logger('relay-table-fuzzer');
     $handler = new StreamHandler('php://stderr', Logger::toMonologLevel($level));
-    $format = "[%extra.microtime% %extra.pid% %level_name%] - %message% %context%\n";
+    $format = "[%extra.microtime% %extra.pid% %level_name%] %message% %context%\n";
     $formatter = new LineFormatter($format, null, true, true);
     $handler->setFormatter($formatter);
     $logger->pushProcessor(static function (LogRecord $record): LogRecord {
