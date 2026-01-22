@@ -5,11 +5,16 @@ declare(strict_types=1);
 
 $sortKey = 'ops';
 $reproducersDir = null;
+$oneLine = false;
 
 foreach (array_slice($argv, 1) as $arg) {
     if ($arg === '-h' || $arg === '--help') {
-        fwrite(STDOUT, "Usage: reprodcuers [path] [--sort=ops|mtime|name]\n");
+        fwrite(STDOUT, "Usage: reprodcuers [path] [--sort=ops|mtime|name] [--oneline]\n");
         exit(0);
+    }
+    if ($arg === '--oneline') {
+        $oneLine = true;
+        continue;
     }
     if (str_starts_with($arg, '--sort=')) {
         $sortKey = substr($arg, strlen('--sort='));
@@ -98,6 +103,17 @@ foreach ($rows as $row) {
     $opsLabel = $row['ops'] !== null ? (string)$row['ops'] : '-';
     $exitLabel = $row['exit_name'] !== '' ? $row['exit_name'] : '-';
     $timeoutLabel = $row['timed_out'] ? 'yes' : 'no';
+    if ($oneLine) {
+        printf(
+            "%{$opsWidth}s  %-{$exitWidth}s  %-3s  %s  %s\n",
+            $opsLabel,
+            $exitLabel,
+            $timeoutLabel,
+            $row['name'],
+            $row['dir']
+        );
+        continue;
+    }
     printf("%{$opsWidth}s  %-{$exitWidth}s  %-3s  %s\n", $opsLabel, $exitLabel, $timeoutLabel, $row['name']);
     if ($row['command'] !== '') {
         fwrite(STDOUT, "  cmd: {$row['command']}\n");
