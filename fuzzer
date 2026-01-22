@@ -4,7 +4,9 @@
 declare(strict_types=1);
 
 use Relay\Table;
+use Monolog\Formatter\LineFormatter;
 use Monolog\Handler\StreamHandler;
+use Monolog\LogRecord;
 use Monolog\Logger;
 use Psr\Log\InvalidArgumentException;
 
@@ -44,6 +46,15 @@ function create_logger(string $level): Logger
 {
     $logger = new Logger('relay-table-fuzzer');
     $handler = new StreamHandler('php://stderr', Logger::toMonologLevel($level));
+    $format = "[%extra.microtime% %extra.pid% %level_name%] - %message% %context%\n";
+    $formatter = new LineFormatter($format, null, true, true);
+    $handler->setFormatter($formatter);
+    $logger->pushProcessor(static function (LogRecord $record): LogRecord {
+        $extra = $record->extra;
+        $extra['microtime'] = sprintf('%.6f', microtime(true));
+        $extra['pid'] = getmypid();
+        return $record->with(extra: $extra);
+    });
     $logger->pushHandler($handler);
     return $logger;
 }
@@ -121,9 +132,13 @@ function generate_command(array $ops, int $keys): array
     return $cmd;
 }
 
-function execute_command(Table $table, array $cmd): void
+function execute_command(Table $table, array $cmd, Logger $logger, int $workerId): void
 {
     $op = $cmd['op'] ?? '';
+    $logger->debug('Executing command', [
+        'worker' => $workerId,
+        'cmd' => $cmd,
+    ]);
     switch ($op) {
         case 'get':
             $table->get((string) $cmd['key']);
@@ -160,7 +175,7 @@ function execute_command(Table $table, array $cmd): void
     }
 }
 
-function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array $opSet, string $namespace): void
+function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array $opSet, string $namespace, Logger $logger): void
 {
     mt_srand($seed + $workerId);
     $table = new Table($namespace);
@@ -168,7 +183,7 @@ function run_random_worker(int $workerId, int $seed, int $ops, int $keys, array 
     for ($i = 0; $i < $ops; $i++) {
         $cmd = generate_command($opSet, $keys);
         try {
-            execute_command($table, $cmd);
+            execute_command($table, $cmd, $logger, $workerId);
         } catch (Throwable $e) {
             fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
         }
@@ -322,7 +337,7 @@ if ($mode === 'queue') {
                 continue;
             }
             try {
-                execute_command($table, $cmd);
+                execute_command($table, $cmd, $logger, 0);
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker 0 error: {$e->getMessage()}\n");
             }
@@ -354,7 +369,7 @@ if ($mode === 'queue') {
                     continue;
                 }
                 try {
-                    execute_command($table, $cmd);
+                    execute_command($table, $cmd, $logger, $i);
                 } catch (Throwable $e) {
                     fwrite(STDERR, "worker {$i} error: {$e->getMessage()}\n");
                 }
@@ -377,7 +392,7 @@ if ($mode !== 'random') {
 }
 
 if ($workers === 0) {
-    run_random_worker(0, $seed, $ops, $keys, $opSet, $namespace);
+    run_random_worker(0, $seed, $ops, $keys, $opSet, $namespace, $logger);
     exit(0);
 }
 
@@ -394,7 +409,7 @@ for ($i = 0; $i < $workers; $i++) {
         exit(1);
     }
     if ($pid === 0) {
-        run_random_worker($i, $seed, $ops, $keys, $opSet, $namespace);
+        run_random_worker($i, $seed, $ops, $keys, $opSet, $namespace, $logger);
         exit(0);
     }
     $pids[] = $pid;
