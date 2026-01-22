@@ -25,12 +25,13 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
   {range(lo,hi)}     -> random integer between lo and hi (inclusive)
   {hrtime}           -> hrtime(true)
+  {ops}              -> value provided via --ops
 USAGE;
 }
 
@@ -79,87 +80,17 @@ function replace_dynamic(string $arg): string
     return $arg;
 }
 
-function move_core_dumps(?int $pid, string $destinationDir): void
+function apply_ops(string $arg, ?int $ops): string
 {
-    if ($pid === null) {
-        return;
+    if ($ops === null) {
+        return $arg;
     }
 
-    $pattern = "/tmp/core.*.{$pid}.*";
-    foreach (glob($pattern) as $coreFile) {
-        $target = $destinationDir . '/' . basename($coreFile);
-        if (@rename($coreFile, $target)) {
-            continue;
-        }
-
-        if (@copy($coreFile, $target)) {
-            @unlink($coreFile);
-        }
-    }
+    return str_replace('{ops}', (string)$ops, $arg);
 }
 
-$argv = $_SERVER['argv'];
-$argc = $_SERVER['argc'];
-
-$phpBin = null;
-$phpIni = null;
-$commandArgs = [];
-
-for ($i = 1; $i < $argc; $i++) {
-    $arg = $argv[$i];
-    if ($arg === '--') {
-        $commandArgs = array_slice($argv, $i + 1);
-        break;
-    }
-
-    if ($arg === '--help' || $arg === '-h') {
-        fwrite(STDOUT, usage($argv[0]) . "\n");
-        exit(0);
-    }
-
-    if ($arg === '--php-bin') {
-        $phpBin = $argv[++$i] ?? null;
-        continue;
-    }
-
-    if ($arg === '--php-ini') {
-        $phpIni = $argv[++$i] ?? null;
-        continue;
-    }
-
-    fwrite(STDERR, "Unknown option: {$arg}\n");
-    fwrite(STDERR, usage($argv[0]) . "\n");
-    exit(1);
-}
-
-if ($phpBin === null || $phpBin === '') {
-    fwrite(STDERR, "Missing required --php-bin\n");
-    fwrite(STDERR, usage($argv[0]) . "\n");
-    exit(1);
-}
-
-if ($commandArgs === []) {
-    fwrite(STDERR, "Missing command after --\n");
-    fwrite(STDERR, usage($argv[0]) . "\n");
-    exit(1);
-}
-
-$reproducersDir = __DIR__ . '/../reproducers';
-if (!is_dir($reproducersDir)) {
-    mkdir($reproducersDir, 0777, true);
-}
-
-$descriptorSpec = [
-    0 => ['file', 'php://stdin', 'r'],
-    1 => ['file', 'php://stdout', 'w'],
-    2 => ['file', 'php://stderr', 'w'],
-];
-
-while (true) {
-    $runArgs = array_map('replace_dynamic', $commandArgs);
-    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
-    $commandString = render_command($fullCommand);
-
+function run_command(array $fullCommand, array $descriptorSpec): array
+{
     $process = proc_open($fullCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
@@ -184,7 +115,169 @@ while (true) {
     }
 
     $isCrash = $signal !== null && in_array($signal, CRASH_SIGNALS, true);
-    if (!$isCrash) {
+
+    return [
+        'exit_code' => $exitCode,
+        'signal' => $signal,
+        'pid' => $pid,
+        'is_crash' => $isCrash,
+    ];
+}
+
+function reduce_ops(
+    int $maxOps,
+    array $dynamicArgs,
+    string $phpBin,
+    ?string $phpIni,
+    array $descriptorSpec
+): int {
+    $low = 1;
+    $high = $maxOps;
+
+    while ($low < $high) {
+        $mid = intdiv($low + $high, 2);
+        $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $mid), $dynamicArgs);
+        $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+        $commandString = render_command($fullCommand);
+        fwrite(STDOUT, "Reducing ops: {$mid} -> {$commandString}\n");
+
+        $result = run_command($fullCommand, $descriptorSpec);
+        if ($result['is_crash']) {
+            $high = $mid;
+            continue;
+        }
+
+        $low = $mid + 1;
+    }
+
+    return $low;
+}
+
+function move_core_dumps(?int $pid, string $destinationDir): void
+{
+    if ($pid === null) {
+        return;
+    }
+
+    $pattern = "/tmp/core.*.{$pid}.*";
+    foreach (glob($pattern) as $coreFile) {
+        $target = $destinationDir . '/' . basename($coreFile);
+        if (@rename($coreFile, $target)) {
+            continue;
+        }
+
+        if (@copy($coreFile, $target)) {
+            @unlink($coreFile);
+        }
+    }
+}
+
+$argv = $_SERVER['argv'];
+$argc = $_SERVER['argc'];
+
+$phpBin = null;
+$phpIni = null;
+$ops = null;
+$reduce = false;
+$commandArgs = [];
+
+for ($i = 1; $i < $argc; $i++) {
+    $arg = $argv[$i];
+    if ($arg === '--') {
+        $commandArgs = array_slice($argv, $i + 1);
+        break;
+    }
+
+    if ($arg === '--help' || $arg === '-h') {
+        fwrite(STDOUT, usage($argv[0]) . "\n");
+        exit(0);
+    }
+
+    if ($arg === '--php-bin') {
+        $phpBin = $argv[++$i] ?? null;
+        continue;
+    }
+
+    if ($arg === '--php-ini') {
+        $phpIni = $argv[++$i] ?? null;
+        continue;
+    }
+
+    if ($arg === '--ops') {
+        $ops = $argv[++$i] ?? null;
+        $ops = is_numeric($ops) ? (int)$ops : null;
+        continue;
+    }
+
+    if ($arg === '--reduce') {
+        $reduce = true;
+        continue;
+    }
+
+    fwrite(STDERR, "Unknown option: {$arg}\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($phpBin === null || $phpBin === '') {
+    fwrite(STDERR, "Missing required --php-bin\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($commandArgs === []) {
+    fwrite(STDERR, "Missing command after --\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+$usesOps = false;
+foreach ($commandArgs as $arg) {
+    if (strpos($arg, '{ops}') !== false) {
+        $usesOps = true;
+        break;
+    }
+}
+
+if ($usesOps && $ops === null) {
+    fwrite(STDERR, "Missing required --ops for {ops} replacement\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($reduce && !$usesOps) {
+    fwrite(STDERR, "--reduce requires {ops} in the command arguments\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($reduce && ($ops === null || $ops <= 0)) {
+    fwrite(STDERR, "--reduce requires a positive --ops value\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+$reproducersDir = __DIR__ . '/../reproducers';
+if (!is_dir($reproducersDir)) {
+    mkdir($reproducersDir, 0777, true);
+}
+
+$descriptorSpec = [
+    0 => ['file', 'php://stdin', 'r'],
+    1 => ['file', 'php://stdout', 'w'],
+    2 => ['file', 'php://stderr', 'w'],
+];
+
+$currentOps = $ops;
+
+while (true) {
+    $dynamicArgs = array_map('replace_dynamic', $commandArgs);
+    $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
+    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+    $commandString = render_command($fullCommand);
+
+    $result = run_command($fullCommand, $descriptorSpec);
+    if (!$result['is_crash']) {
         continue;
     }
 
@@ -194,18 +287,39 @@ while (true) {
     $jobDir = $reproducersDir . '/' . $jobId;
     mkdir($jobDir, 0777, true);
 
-    file_put_contents($jobDir . '/command.txt', $commandString . "\n");
+    $finalCommand = $commandString;
+    $finalOps = $currentOps;
+
+    if ($reduce && $currentOps !== null) {
+        fwrite(STDOUT, "Reducing ops starting from {$currentOps}\n");
+        $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $descriptorSpec);
+        $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
+        $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
+
+        if ($finalCommand !== $commandString) {
+            file_put_contents($jobDir . '/command-original.txt', $commandString . "\n");
+        }
+    }
+
+    file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+
+    $signal = $result['signal'];
+    $exitCode = $result['exit_code'];
+    $pid = $result['pid'];
 
     $signalLabel = $signal !== null ? signal_label($signal) : 'none';
     $signalDesc = $signal !== null ? signal_description($signal) : '';
     $exitName = $signal !== null ? $signalLabel : "EXIT_{$exitCode}";
 
     $report = [
-        "command: {$commandString}",
+        "command: {$finalCommand}",
         "exit_code: {$exitCode}",
         "exit_name: {$exitName}",
         "signal: {$signalLabel}",
     ];
+    if ($finalOps !== null) {
+        $report[] = "ops: {$finalOps}";
+    }
     if ($signalDesc !== '') {
         $report[] = "signal_desc: {$signalDesc}";
     }
@@ -216,5 +330,11 @@ while (true) {
     move_core_dumps($pid, $jobDir);
 
     fwrite(STDOUT, "Reproducer saved: {$jobDir}\n");
+
+    if ($reduce && $finalOps !== null) {
+        $currentOps = $finalOps;
+        continue;
+    }
+
     exit(1);
 }

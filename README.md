@@ -25,7 +25,7 @@ php /tmp/relay-fuzzer.php
 ## Run with the crash harness
 
 ```bash
-./bin/harness --php-bin ./php85d -- ./bin/fuzzer --ops 1000 --seed {hrtime} --keys {range(1,500)}
+./bin/harness --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
 ```
 
 ```bash
