@@ -602,7 +602,8 @@ function reduce_ops(
             $stats['last_failure_time'] = microtime(true);
             $stats['last_failure_summary'] = build_failure_summary($result);
             $stats['last_event'] = "reducer crash at ops {$mid}";
-            move_core_dumps($result['core_files'], $jobDir);
+            $movedCores = move_core_dumps($result['core_files'], $jobDir);
+            generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
         }
         cleanup_output_files($result);
         maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
@@ -617,18 +618,112 @@ function reduce_ops(
     return $low;
 }
 
-function move_core_dumps(array $coreFiles, string $destinationDir): void
+function resolve_php_binary_for_gdb(string $phpBin): ?string
 {
+    $resolved = $phpBin;
+    if (is_link($phpBin)) {
+        $link = readlink($phpBin);
+        if ($link !== false) {
+            if (substr($link, 0, 1) !== '/') {
+                $link = dirname($phpBin) . '/' . $link;
+            }
+            $resolved = $link;
+        }
+    }
+
+    $real = realpath($resolved);
+    if ($real !== false) {
+        $resolved = $real;
+    }
+
+    return is_file($resolved) ? $resolved : null;
+}
+
+function find_gdb_binary(): ?string
+{
+    $output = [];
+    $exitCode = 0;
+    @exec('command -v gdb', $output, $exitCode);
+    if ($exitCode !== 0 || $output === []) {
+        return null;
+    }
+
+    $path = trim($output[0] ?? '');
+    return $path !== '' ? $path : null;
+}
+
+function generate_gdb_backtraces(array $coreFiles, string $destinationDir, string $phpBin): void
+{
+    if ($coreFiles === []) {
+        return;
+    }
+
+    $gdb = find_gdb_binary();
+    $phpPath = resolve_php_binary_for_gdb($phpBin);
+
+    $suffix = count($coreFiles) > 1;
+    foreach ($coreFiles as $coreFile) {
+        $base = basename($coreFile);
+        $tracePath = $destinationDir . '/' . ($suffix ? "gdb-backtrace-{$base}.txt" : 'gdb-backtrace.txt');
+
+        if ($gdb === null) {
+            file_put_contents($tracePath, "gdb not found in PATH\n");
+            continue;
+        }
+
+        if ($phpPath === null) {
+            file_put_contents($tracePath, "php binary not found for gdb\n");
+            continue;
+        }
+
+        $descriptorSpec = [
+            0 => ['file', '/dev/null', 'r'],
+            1 => ['file', $tracePath, 'w'],
+            2 => ['file', $tracePath . '.err', 'w'],
+        ];
+        $command = [
+            $gdb,
+            '-batch',
+            '-ex',
+            'set pagination off',
+            '-ex',
+            'thread apply all bt full',
+            $phpPath,
+            $coreFile,
+        ];
+        $process = proc_open($command, $descriptorSpec, $pipes);
+        if (!is_resource($process)) {
+            file_put_contents($tracePath, "failed to start gdb\n");
+            continue;
+        }
+
+        $status = proc_get_status($process);
+        while (($status['running'] ?? false) === true) {
+            usleep(10000);
+            $status = proc_get_status($process);
+        }
+
+        proc_close($process);
+    }
+}
+
+function move_core_dumps(array $coreFiles, string $destinationDir): array
+{
+    $moved = [];
     foreach ($coreFiles as $coreFile) {
         $target = $destinationDir . '/' . basename($coreFile);
         if (@rename($coreFile, $target)) {
+            $moved[] = $target;
             continue;
         }
 
         if (@copy($coreFile, $target)) {
             @unlink($coreFile);
+            $moved[] = $target;
         }
     }
+
+    return $moved;
 }
 
 function cleanup_output_files(array $result): void
@@ -1111,7 +1206,8 @@ while (true) {
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
 
-        move_core_dumps($crashResult['core_files'], $jobDir);
+        $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
+        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
         $stats['reproducers']++;
         $stats['last_event'] = "reproducer saved: {$jobDir}";
