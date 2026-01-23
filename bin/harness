@@ -611,6 +611,20 @@ function build_failure_summary(array $result): string
     return 'EXIT_' . $result['exit_code'];
 }
 
+function ensure_core_ulimit_unlimited(): void
+{
+    $output = [];
+    $exitCode = 0;
+    exec('sh -c "ulimit -c"', $output, $exitCode);
+    $value = $output !== [] ? trim($output[0]) : '';
+
+    if ($exitCode !== 0 || $value !== 'unlimited') {
+        fwrite(STDERR, "Core dump ulimit is not unlimited (ulimit -c returned \"{$value}\").\n");
+        fwrite(STDERR, "Set it with: ulimit -c unlimited\n");
+        exit(1);
+    }
+}
+
 $argv = $_SERVER['argv'];
 $argc = $_SERVER['argc'];
 
@@ -755,6 +769,8 @@ if ($renderInterval === null || $renderInterval <= 0) {
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
 }
+
+ensure_core_ulimit_unlimited();
 
 $reproducersDir = __DIR__ . '/../reproducers';
 if (!is_dir($reproducersDir)) {
