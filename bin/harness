@@ -105,6 +105,28 @@ function format_duration(int $seconds): string
     return sprintf('%02d:%02d:%02d', $hours, $minutes, $seconds);
 }
 
+function format_bytes(int $bytes): string
+{
+    $units = ['B', 'K', 'M', 'G', 'T'];
+    $value = (float)$bytes;
+    $unitIndex = 0;
+
+    while ($value >= 1024 && $unitIndex < count($units) - 1) {
+        $value /= 1024;
+        $unitIndex++;
+    }
+
+    if ($unitIndex === 0) {
+        return (string)$bytes;
+    }
+
+    $precision = $value >= 10 ? 0 : 1;
+    $formatted = number_format($value, $precision, '.', '');
+    $formatted = rtrim(rtrim($formatted, '0'), '.');
+
+    return $formatted . $units[$unitIndex];
+}
+
 function terminal_width(): int
 {
     $columns = getenv('COLUMNS');
@@ -170,6 +192,16 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $lines[] = two_column("Last failure: {$sinceFailure}", 'Reductions: ' . number_format($stats['reductions']), $width);
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
     $lines[] = two_column("Ops: {$opsLabel}", "Mode: {$mode}", $width);
+    $memoryLine = 'Relay mem: n/a';
+    $relayMemory = $stats['relay_memory'] ?? null;
+    if (is_array($relayMemory)) {
+        $used = format_bytes((int)($relayMemory['used'] ?? 0));
+        $total = format_bytes((int)($relayMemory['total'] ?? 0));
+        $active = format_bytes((int)($relayMemory['active'] ?? 0));
+        $limit = format_bytes((int)($relayMemory['limit'] ?? 0));
+        $memoryLine = "Relay mem: {$used}/{$total} (active {$active}, limit {$limit})";
+    }
+    $lines[] = pad_line($memoryLine, $width);
     $lastFailure = $stats['last_failure_summary'] !== '' ? $stats['last_failure_summary'] : 'none';
     $event = $stats['last_event'] !== '' ? $stats['last_event'] : 'none';
     $lines[] = two_column("Last crash: {$lastFailure}", "Event: {$event}", $width);
@@ -600,6 +632,42 @@ function move_output_files(array $result, string $destinationDir): array
     return $moved;
 }
 
+function parse_relay_memory_from_output(?string $stdoutPath): ?array
+{
+    if (!is_string($stdoutPath) || $stdoutPath === '' || !is_file($stdoutPath)) {
+        return null;
+    }
+
+    $lines = @file($stdoutPath, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return null;
+    }
+
+    $prefix = 'RELAY_MEMORY_JSON:';
+    for ($i = count($lines) - 1; $i >= 0; $i--) {
+        $line = trim($lines[$i]);
+        if ($line === '') {
+            continue;
+        }
+        if (strpos($line, $prefix) === 0) {
+            $line = trim(substr($line, strlen($prefix)));
+        }
+        if ($line === '') {
+            continue;
+        }
+        $data = json_decode($line, true);
+        if (!is_array($data)) {
+            continue;
+        }
+        if (!isset($data['total'], $data['limit'], $data['active'], $data['used'])) {
+            continue;
+        }
+        return $data;
+    }
+
+    return null;
+}
+
 function build_failure_summary(array $result): string
 {
     if (!empty($result['timed_out'])) {
@@ -807,6 +875,7 @@ $stats = [
     'last_event' => '',
     'last_reproducer' => '',
     'active_jobs' => 0,
+    'relay_memory' => null,
 ];
 
 $jobCounter = 0;
@@ -854,6 +923,18 @@ while (true) {
         if ($job['cancelled']) {
             cleanup_output_files($result);
             continue;
+        }
+
+        if (
+            $result['exit_code'] === 0
+            && $result['signal'] === null
+            && !$result['timed_out']
+            && !$result['is_crash']
+        ) {
+            $memory = parse_relay_memory_from_output($result['stdout_path']);
+            if ($memory !== null) {
+                $stats['relay_memory'] = $memory;
+            }
         }
 
         if ($result['is_crash'] && $crashResult === null) {

@@ -9,6 +9,8 @@ use Mgrunder\RelayTableFuzzer\Console\Usage;
 use Mgrunder\RelayTableFuzzer\FuzzerRunner;
 use Mgrunder\RelayTableFuzzer\LoggerFactory;
 use Psr\Log\InvalidArgumentException;
+use Relay\Relay;
+use Throwable;
 
 require_once __DIR__ . '/../vendor/autoload.php';
 
@@ -96,4 +98,18 @@ try {
 } catch (RuntimeException $e) {
     fwrite(STDERR, $e->getMessage() . "\n");
     exit(1);
+}
+
+if (class_exists(Relay::class)) {
+    try {
+        $stats = Relay::stats();
+        $memory = $stats['memory'] ?? null;
+        if (is_array($memory)) {
+            $payload = json_encode($memory, JSON_UNESCAPED_SLASHES);
+            if ($payload !== false) {
+                fwrite(STDOUT, "RELAY_MEMORY_JSON: {$payload}\n");
+            }
+        }
+    } catch (Throwable) {
+    }
 }
