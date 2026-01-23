@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--jobs N] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -182,6 +182,23 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
 
     fwrite(STDOUT, "\033[2J\033[H" . implode("\n", $lines) . "\n");
     fflush(STDOUT);
+}
+
+function maybe_render_screen(
+    array $stats,
+    ?int $currentOps,
+    string $mode,
+    float $interval,
+    float &$lastRenderTime,
+    bool $force = false
+): void {
+    $now = microtime(true);
+    if (!$force && $interval > 0 && ($now - $lastRenderTime) < $interval) {
+        return;
+    }
+
+    $lastRenderTime = $now;
+    render_screen($stats, $currentOps, $mode);
 }
 
 function find_core_dumps(string $phpBin, ?int $pid): array
@@ -400,7 +417,9 @@ function reduce_ops(
     ?string $phpIni,
     array &$stats,
     string $jobDir,
-    ?int $maxSeconds
+    ?int $maxSeconds,
+    float $renderInterval,
+    float &$lastRenderTime
 ): int {
     $low = 1;
     $high = $maxOps;
@@ -422,7 +441,7 @@ function reduce_ops(
             move_core_dumps($result['core_files'], $jobDir);
         }
         cleanup_output_files($result);
-        render_screen($stats, $mid, 'reducing');
+        maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
         if ($result['is_crash']) {
             $high = $mid;
             continue;
@@ -517,6 +536,7 @@ $ops = null;
 $reduce = false;
 $maxSeconds = null;
 $jobs = 1;
+$renderInterval = 1.0;
 $commandArgs = [];
 
 for ($i = 1; $i < $argc; $i++) {
@@ -561,6 +581,12 @@ for ($i = 1; $i < $argc; $i++) {
     if ($arg === '--jobs') {
         $jobs = $argv[++$i] ?? null;
         $jobs = is_numeric($jobs) ? (int)$jobs : null;
+        continue;
+    }
+
+    if ($arg === '--interval') {
+        $renderInterval = $argv[++$i] ?? null;
+        $renderInterval = is_numeric($renderInterval) ? (float)$renderInterval : null;
         continue;
     }
 
@@ -619,6 +645,12 @@ if ($jobs === null || $jobs <= 0) {
     exit(1);
 }
 
+if ($renderInterval === null || $renderInterval <= 0) {
+    fwrite(STDERR, "--interval requires a positive number\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 $reproducersDir = __DIR__ . '/../reproducers';
 if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
@@ -643,6 +675,7 @@ $runningJobs = [];
 $crashResult = null;
 $crashJob = null;
 $stopAfterCrash = false;
+$lastRenderTime = 0.0;
 
 while (true) {
     $progress = false;
@@ -691,9 +724,24 @@ while (true) {
         }
 
         $stats['active_jobs'] = count($runningJobs);
-        render_screen($stats, $currentOps, $stopAfterCrash ? 'reducing' : 'fuzzing');
+        maybe_render_screen(
+            $stats,
+            $currentOps,
+            $stopAfterCrash ? 'reducing' : 'fuzzing',
+            $renderInterval,
+            $lastRenderTime,
+            $result['is_crash']
+        );
     }
     unset($job);
+
+    maybe_render_screen(
+        $stats,
+        $currentOps,
+        $stopAfterCrash ? 'reducing' : 'fuzzing',
+        $renderInterval,
+        $lastRenderTime
+    );
 
     if ($crashResult !== null && $runningJobs === []) {
         $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
@@ -707,7 +755,17 @@ while (true) {
         if ($reduce && $currentOps !== null) {
             $stats['reductions']++;
             $stats['active_jobs'] = 1;
-            $finalOps = reduce_ops($currentOps, $dynamicArgs, $phpBin, $phpIni, $stats, $jobDir, $maxSeconds);
+            $finalOps = reduce_ops(
+                $currentOps,
+                $dynamicArgs,
+                $phpBin,
+                $phpIni,
+                $stats,
+                $jobDir,
+                $maxSeconds,
+                $renderInterval,
+                $lastRenderTime
+            );
             $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
             $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
 
@@ -779,7 +837,14 @@ while (true) {
         $stats['last_event'] = "reproducer saved: {$jobDir}";
         $stats['last_reproducer'] = $jobDir;
         $stats['active_jobs'] = 0;
-        render_screen($stats, $currentOps, $reduce ? 'reducing' : 'fuzzing');
+        maybe_render_screen(
+            $stats,
+            $currentOps,
+            $reduce ? 'reducing' : 'fuzzing',
+            $renderInterval,
+            $lastRenderTime,
+            true
+        );
 
         if ($reduce && $finalOps !== null) {
             $currentOps = $finalOps;
