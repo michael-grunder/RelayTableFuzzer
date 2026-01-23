@@ -160,11 +160,15 @@ function pad_line(string $text, int $width): string
     return str_pad($text, $width);
 }
 
-function two_column(string $left, string $right, int $width, int $gap = 3): string
+function two_column(string $left, string $right, int $width, int $gap = 3, ?int $leftWidth = null): string
 {
     $gap = max(1, $gap);
-    $leftWidth = intdiv($width - $gap, 2);
-    $rightWidth = $width - $gap - $leftWidth;
+    if ($leftWidth === null) {
+        $leftWidth = intdiv($width - $gap, 2);
+    }
+
+    $leftWidth = max(1, min($leftWidth, $width - $gap - 1));
+    $rightWidth = max(1, $width - $gap - $leftWidth);
 
     $left = str_pad(truncate_text($left, $leftWidth), $leftWidth);
     $right = str_pad(truncate_text($right, $rightWidth), $rightWidth);
@@ -192,27 +196,39 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $lines[] = pad_line(str_pad($title, $width, ' ', STR_PAD_BOTH), $width);
     $lines[] = str_repeat('-', $width);
     $activeJobs = $stats['active_jobs'] ?? 1;
-    $lines[] = two_column(
-        format_label_value('Elapsed', $elapsed),
-        format_label_value('Runs', number_format($stats['runs'])),
-        $width
-    );
-    $lines[] = two_column(
-        format_label_value('Jobs', (string)$activeJobs),
-        format_label_value('Reproducers', number_format($stats['reproducers'])),
-        $width
-    );
-    $lines[] = two_column(
-        format_label_value('Last failure', $sinceFailure),
-        format_label_value('Reductions', number_format($stats['reductions'])),
-        $width
-    );
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
-    $lines[] = two_column(
-        format_label_value('Ops', $opsLabel),
-        format_label_value('Mode', $mode),
-        $width
-    );
+    $pairs = [
+        [
+            format_label_value('Elapsed', $elapsed),
+            format_label_value('Runs', number_format($stats['runs'])),
+        ],
+        [
+            format_label_value('Jobs', (string)$activeJobs),
+            format_label_value('Reproducers', number_format($stats['reproducers'])),
+        ],
+        [
+            format_label_value('Last failure', $sinceFailure),
+            format_label_value('Reductions', number_format($stats['reductions'])),
+        ],
+        [
+            format_label_value('Ops', $opsLabel),
+            format_label_value('Mode', $mode),
+        ],
+    ];
+    $maxLeft = 0;
+    $maxRight = 0;
+    foreach ($pairs as [$left, $right]) {
+        $maxLeft = max($maxLeft, strlen($left));
+        $maxRight = max($maxRight, strlen($right));
+    }
+    $gap = 3;
+    $leftWidth = min($maxLeft, max(1, $width - $gap - 1));
+    if ($maxRight > 0 && $leftWidth + $gap + $maxRight > $width) {
+        $leftWidth = max(1, $width - $gap - $maxRight);
+    }
+    foreach ($pairs as [$left, $right]) {
+        $lines[] = two_column($left, $right, $width, $gap, $leftWidth);
+    }
     $memoryLine = 'Relay mem: n/a';
     $relayMemory = $stats['relay_memory'] ?? null;
     if (is_array($relayMemory)) {
@@ -226,7 +242,9 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $lines[] = two_column(
         format_label_value('Last crash', $lastFailure),
         format_label_value('Event', $event),
-        $width
+        $width,
+        $gap,
+        $leftWidth
     );
     $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
     $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
