@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--timeout-signal SIG] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -658,7 +658,7 @@ for ($i = 1; $i < $argc; $i++) {
         continue;
     }
 
-    if ($arg === '--max-seconds') {
+    if ($arg === '--timeout') {
         $maxSeconds = $argv[++$i] ?? null;
         $maxSeconds = is_numeric($maxSeconds) ? (int)$maxSeconds : null;
         continue;
@@ -733,13 +733,13 @@ if ($reduce && ($ops === null || $ops <= 0)) {
 }
 
 if ($maxSeconds !== null && $maxSeconds <= 0) {
-    fwrite(STDERR, "--max-seconds requires a positive integer\n");
+    fwrite(STDERR, "--timeout requires a positive integer\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
 }
 
 if ($timeoutSignalArg !== null && $maxSeconds === null) {
-    fwrite(STDERR, "--timeout-signal requires --max-seconds\n");
+    fwrite(STDERR, "--timeout-signal requires --timeout\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
 }
