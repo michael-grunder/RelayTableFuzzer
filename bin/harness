@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--max-seconds N] [--timeout-signal SIG] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -201,21 +201,89 @@ function maybe_render_screen(
     render_screen($stats, $currentOps, $mode);
 }
 
-function find_core_dumps(string $phpBin, ?int $pid): array
+function find_core_dumps(string $phpBin, ?int $pid, ?float $startTime = null): array
 {
-    if ($pid === null) {
+    $binary = basename($phpBin);
+    if ($pid !== null) {
+        $pattern = "/tmp/core.{$binary}.{$pid}.*";
+        $cores = glob($pattern);
+        return $cores !== false ? $cores : [];
+    }
+
+    if ($startTime === null) {
         return [];
     }
 
-    $binary = basename($phpBin);
-    $pattern = "/tmp/core.{$binary}.{$pid}.*";
+    $pattern = "/tmp/core.{$binary}.*";
     $cores = glob($pattern);
+    if ($cores === false) {
+        return [];
+    }
 
-    return $cores !== false ? $cores : [];
+    $cutoff = max(0, (int)$startTime - 1);
+    return array_values(array_filter($cores, static function (string $path) use ($cutoff): bool {
+        $mtime = @filemtime($path);
+        return $mtime !== false && $mtime >= $cutoff;
+    }));
 }
 
-function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): array
+function parse_timeout_signal(?string $value): ?array
 {
+    if ($value === null || $value === '') {
+        return null;
+    }
+
+    if (ctype_digit($value)) {
+        return ['arg' => $value, 'num' => (int)$value];
+    }
+
+    $name = strtoupper($value);
+    if (strpos($name, 'SIG') !== 0) {
+        $name = 'SIG' . $name;
+    }
+
+    if (!defined($name)) {
+        return null;
+    }
+
+    return ['arg' => $name, 'num' => (int)constant($name)];
+}
+
+function wrap_timeout_command(array $command, ?int $maxSeconds, ?string $timeoutSignalArg): array
+{
+    if ($maxSeconds === null) {
+        return $command;
+    }
+
+    $wrapped = ['timeout'];
+    if ($timeoutSignalArg !== null) {
+        $wrapped[] = '--signal=' . $timeoutSignalArg;
+    }
+    $wrapped[] = (string)$maxSeconds;
+
+    return array_merge($wrapped, $command);
+}
+
+function is_timeout_exit(int $exitCode, ?int $timeoutSignal): bool
+{
+    if ($exitCode === 124) {
+        return true;
+    }
+
+    if ($timeoutSignal !== null && $exitCode === 128 + $timeoutSignal) {
+        return true;
+    }
+
+    return false;
+}
+
+function run_command(
+    array $fullCommand,
+    string $phpBin,
+    ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal
+): array {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
     $descriptorSpec = [
@@ -224,7 +292,8 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $process = proc_open($fullCommand, $descriptorSpec, $pipes);
+    $execCommand = wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg);
+    $process = proc_open($execCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
         exit(1);
@@ -232,21 +301,13 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
 
     $status = proc_get_status($process);
     $pid = $status['pid'] ?? null;
+    if ($maxSeconds !== null) {
+        $pid = null;
+    }
     $start = microtime(true);
-    $timedOut = false;
 
     while ($status['running']) {
         usleep(10000);
-        if ($maxSeconds !== null && (microtime(true) - $start) >= $maxSeconds) {
-            $timedOut = true;
-            proc_terminate($process);
-            usleep(100000);
-            $status = proc_get_status($process);
-            if ($status['running']) {
-                proc_terminate($process, SIGKILL);
-            }
-            break;
-        }
         $status = proc_get_status($process);
     }
 
@@ -261,6 +322,7 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
     }
 
     $exitCode = proc_close($process);
+    $timedOut = $maxSeconds !== null ? is_timeout_exit($exitCode, $timeoutSignal) : false;
 
     $signal = null;
     if (($status['signaled'] ?? false) && isset($status['termsig'])) {
@@ -269,7 +331,12 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
         $signal = $exitCode - 128;
     }
 
-    $coreFiles = find_core_dumps($phpBin, $pid);
+    if ($timedOut) {
+        $signal = null;
+    }
+
+    $usesTimeout = $maxSeconds !== null;
+    $coreFiles = find_core_dumps($phpBin, $usesTimeout ? null : $pid, $start);
     $isCrash = $timedOut || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
 
     return [
@@ -279,13 +346,19 @@ function run_command(array $fullCommand, string $phpBin, ?int $maxSeconds): arra
         'timed_out' => $timedOut,
         'is_crash' => $isCrash,
         'core_files' => $coreFiles,
+        'timeout_signal' => $timedOut ? $timeoutSignalArg : null,
         'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
         'stderr_path' => $stderrPath !== false ? $stderrPath : null,
     ];
 }
 
-function start_command(array $fullCommand, string $phpBin): array
-{
+function start_command(
+    array $fullCommand,
+    string $phpBin,
+    ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal
+): array {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
     $descriptorSpec = [
@@ -294,7 +367,8 @@ function start_command(array $fullCommand, string $phpBin): array
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $process = proc_open($fullCommand, $descriptorSpec, $pipes);
+    $execCommand = wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg);
+    $process = proc_open($execCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
         exit(1);
@@ -304,19 +378,24 @@ function start_command(array $fullCommand, string $phpBin): array
 
     return [
         'process' => $process,
-        'pid' => $status['pid'] ?? null,
+        'pid' => $maxSeconds !== null ? null : ($status['pid'] ?? null),
         'start_time' => microtime(true),
         'php_bin' => $phpBin,
         'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
         'stderr_path' => $stderrPath !== false ? $stderrPath : null,
         'timed_out' => false,
         'cancelled' => false,
+        'uses_timeout' => $maxSeconds !== null,
+        'timeout_signal' => $timeoutSignal,
+        'timeout_signal_arg' => $timeoutSignalArg,
     ];
 }
 
-function finalize_command(array $job, array $status): array
+function finalize_command(array $job, array $status, ?int $timeoutSignal): array
 {
     $exitCode = proc_close($job['process']);
+    $timedOut = (!empty($job['uses_timeout']) && is_timeout_exit($exitCode, $timeoutSignal));
+
     $signal = null;
     if (($status['signaled'] ?? false) && isset($status['termsig'])) {
         $signal = (int)$status['termsig'];
@@ -324,22 +403,32 @@ function finalize_command(array $job, array $status): array
         $signal = $exitCode - 128;
     }
 
-    $coreFiles = find_core_dumps($job['php_bin'], $job['pid']);
-    $isCrash = $job['timed_out'] || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
+    if ($timedOut) {
+        $signal = null;
+    }
+
+    $coreFiles = find_core_dumps(
+        $job['php_bin'],
+        empty($job['uses_timeout']) ? $job['pid'] : null,
+        $job['start_time'] ?? null
+    );
+    $isCrash = ($job['timed_out'] || $timedOut)
+        || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
 
     return [
         'exit_code' => $exitCode,
         'signal' => $signal,
         'pid' => $job['pid'],
-        'timed_out' => $job['timed_out'],
+        'timed_out' => $job['timed_out'] || $timedOut,
         'is_crash' => $isCrash,
         'core_files' => $coreFiles,
+        'timeout_signal' => $timedOut ? ($job['timeout_signal_arg'] ?? null) : null,
         'stdout_path' => $job['stdout_path'],
         'stderr_path' => $job['stderr_path'],
     ];
 }
 
-function poll_command(array &$job, ?int $maxSeconds): ?array
+function poll_command(array &$job, ?int $timeoutSignal): ?array
 {
     $status = proc_get_status($job['process']);
     if ($status['running']) {
@@ -352,17 +441,7 @@ function poll_command(array &$job, ?int $maxSeconds): ?array
             return null;
         }
 
-        if ($maxSeconds !== null && (microtime(true) - $job['start_time']) >= $maxSeconds) {
-            $job['timed_out'] = true;
-            proc_terminate($job['process']);
-            usleep(100000);
-            $status = proc_get_status($job['process']);
-            if ($status['running']) {
-                proc_terminate($job['process'], SIGKILL);
-            }
-        } else {
-            return null;
-        }
+        return null;
     }
 
     if ($status['running']) {
@@ -375,7 +454,7 @@ function poll_command(array &$job, ?int $maxSeconds): ?array
         }
     }
 
-    return finalize_command($job, $status);
+    return finalize_command($job, $status, $timeoutSignal);
 }
 
 function cancel_command(array &$job): void
@@ -394,17 +473,20 @@ function create_job(
     ?int $currentOps,
     string $phpBin,
     ?string $phpIni,
-    int $jobId
+    int $jobId,
+    ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal
 ): array {
     $dynamicArgs = array_map('replace_dynamic', $commandArgs);
     $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
     $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
 
-    $job = start_command($fullCommand, $phpBin);
+    $job = start_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal);
     $job['id'] = $jobId;
     $job['dynamic_args'] = $dynamicArgs;
     $job['full_command'] = $fullCommand;
-    $job['command_string'] = render_command($fullCommand);
+    $job['command_string'] = render_command(wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg));
     $job['ops'] = $currentOps;
 
     return $job;
@@ -418,6 +500,8 @@ function reduce_ops(
     array &$stats,
     string $jobDir,
     ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal,
     float $renderInterval,
     float &$lastRenderTime
 ): int {
@@ -428,9 +512,9 @@ function reduce_ops(
         $mid = intdiv($low + $high, 2);
         $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $mid), $dynamicArgs);
         $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
-        $commandString = render_command($fullCommand);
+        $commandString = render_command(wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg));
 
-        $result = run_command($fullCommand, $phpBin, $maxSeconds);
+        $result = run_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal);
         $stats['runs']++;
         $stats['last_command'] = $commandString;
         $stats['last_event'] = "reducing ops: {$mid}";
@@ -535,6 +619,8 @@ $phpIni = null;
 $ops = null;
 $reduce = false;
 $maxSeconds = null;
+$timeoutSignalArg = null;
+$timeoutSignal = null;
 $jobs = 1;
 $renderInterval = 1.0;
 $commandArgs = [];
@@ -575,6 +661,19 @@ for ($i = 1; $i < $argc; $i++) {
     if ($arg === '--max-seconds') {
         $maxSeconds = $argv[++$i] ?? null;
         $maxSeconds = is_numeric($maxSeconds) ? (int)$maxSeconds : null;
+        continue;
+    }
+
+    if ($arg === '--timeout-signal') {
+        $signalValue = $argv[++$i] ?? null;
+        $parsed = parse_timeout_signal($signalValue);
+        if ($parsed === null) {
+            fwrite(STDERR, "--timeout-signal requires a valid signal name or number\n");
+            fwrite(STDERR, usage($argv[0]) . "\n");
+            exit(1);
+        }
+        $timeoutSignalArg = $parsed['arg'];
+        $timeoutSignal = $parsed['num'];
         continue;
     }
 
@@ -639,6 +738,12 @@ if ($maxSeconds !== null && $maxSeconds <= 0) {
     exit(1);
 }
 
+if ($timeoutSignalArg !== null && $maxSeconds === null) {
+    fwrite(STDERR, "--timeout-signal requires --max-seconds\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 if ($jobs === null || $jobs <= 0) {
     fwrite(STDERR, "--jobs requires a positive integer\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
@@ -682,7 +787,16 @@ while (true) {
 
     while (!$stopAfterCrash && count($runningJobs) < $jobs) {
         $jobCounter++;
-        $job = create_job($commandArgs, $currentOps, $phpBin, $phpIni, $jobCounter);
+        $job = create_job(
+            $commandArgs,
+            $currentOps,
+            $phpBin,
+            $phpIni,
+            $jobCounter,
+            $maxSeconds,
+            $timeoutSignalArg,
+            $timeoutSignal
+        );
         $runningJobs[$job['id']] = $job;
         $stats['last_command'] = $job['command_string'];
         $stats['last_event'] = "spawned job {$job['id']}";
@@ -692,7 +806,7 @@ while (true) {
     $stats['active_jobs'] = count($runningJobs);
 
     foreach ($runningJobs as $jobId => &$job) {
-        $result = poll_command($job, $maxSeconds);
+        $result = poll_command($job, $timeoutSignal);
         if ($result === null) {
             continue;
         }
@@ -763,11 +877,17 @@ while (true) {
                 $stats,
                 $jobDir,
                 $maxSeconds,
+                $timeoutSignalArg,
+                $timeoutSignal,
                 $renderInterval,
                 $lastRenderTime
             );
             $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
-            $finalCommand = render_command(array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs));
+            $finalCommand = render_command(wrap_timeout_command(
+                array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs),
+                $maxSeconds,
+                $timeoutSignalArg
+            ));
 
             if ($finalCommand !== $crashJob['command_string']) {
                 file_put_contents($jobDir . '/command-original.txt', $crashJob['command_string'] . "\n");
@@ -805,6 +925,9 @@ while (true) {
             $reportData['timed_out'] = true;
             if ($maxSeconds !== null) {
                 $reportData['max_seconds'] = $maxSeconds;
+            }
+            if (!empty($crashResult['timeout_signal'])) {
+                $reportData['timeout_signal'] = $crashResult['timeout_signal'];
             }
         }
         $reportData['pid'] = $pid ?? 'unknown';
