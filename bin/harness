@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -282,7 +282,8 @@ function run_command(
     string $phpBin,
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
-    ?int $timeoutSignal
+    ?int $timeoutSignal,
+    bool $onlyCrashes
 ): array {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
@@ -337,7 +338,10 @@ function run_command(
 
     $usesTimeout = $maxSeconds !== null;
     $coreFiles = find_core_dumps($phpBin, $usesTimeout ? null : $pid, $start);
-    $isCrash = $timedOut || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
+    $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
+    if (!$onlyCrashes) {
+        $isCrash = $timedOut || $isCrash;
+    }
 
     return [
         'exit_code' => $exitCode,
@@ -391,7 +395,7 @@ function start_command(
     ];
 }
 
-function finalize_command(array $job, array $status, ?int $timeoutSignal): array
+function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $onlyCrashes): array
 {
     $exitCode = proc_close($job['process']);
     $timedOut = (!empty($job['uses_timeout']) && is_timeout_exit($exitCode, $timeoutSignal));
@@ -412,8 +416,10 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal): array
         empty($job['uses_timeout']) ? $job['pid'] : null,
         $job['start_time'] ?? null
     );
-    $isCrash = ($job['timed_out'] || $timedOut)
-        || (($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== []);
+    $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
+    if (!$onlyCrashes) {
+        $isCrash = ($job['timed_out'] || $timedOut) || $isCrash;
+    }
 
     return [
         'exit_code' => $exitCode,
@@ -428,7 +434,7 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal): array
     ];
 }
 
-function poll_command(array &$job, ?int $timeoutSignal): ?array
+function poll_command(array &$job, ?int $timeoutSignal, bool $onlyCrashes): ?array
 {
     $status = proc_get_status($job['process']);
     if ($status['running']) {
@@ -454,7 +460,7 @@ function poll_command(array &$job, ?int $timeoutSignal): ?array
         }
     }
 
-    return finalize_command($job, $status, $timeoutSignal);
+    return finalize_command($job, $status, $timeoutSignal, $onlyCrashes);
 }
 
 function cancel_command(array &$job): void
@@ -502,6 +508,7 @@ function reduce_ops(
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
+    bool $onlyCrashes,
     float $renderInterval,
     float &$lastRenderTime
 ): int {
@@ -514,7 +521,7 @@ function reduce_ops(
         $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
         $commandString = render_command(wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg));
 
-        $result = run_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal);
+        $result = run_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $onlyCrashes);
         $stats['runs']++;
         $stats['last_command'] = $commandString;
         $stats['last_event'] = "reducing ops: {$mid}";
@@ -632,6 +639,7 @@ $phpBin = null;
 $phpIni = null;
 $ops = null;
 $reduce = false;
+$onlyCrashes = false;
 $maxSeconds = null;
 $timeoutSignalArg = null;
 $timeoutSignal = null;
@@ -669,6 +677,11 @@ for ($i = 1; $i < $argc; $i++) {
 
     if ($arg === '--reduce') {
         $reduce = true;
+        continue;
+    }
+
+    if ($arg === '--only-crashes') {
+        $onlyCrashes = true;
         continue;
     }
 
@@ -758,6 +771,11 @@ if ($timeoutSignalArg !== null && $maxSeconds === null) {
     exit(1);
 }
 
+if ($onlyCrashes && $timeoutSignal !== null && in_array($timeoutSignal, CRASH_SIGNALS, true)) {
+    fwrite(STDERR, "you can't set the timeout signal to a crash signal and then ask for only crashes\n");
+    exit(1);
+}
+
 if ($jobs === null || $jobs <= 0) {
     fwrite(STDERR, "--jobs requires a positive integer\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
@@ -822,7 +840,7 @@ while (true) {
     $stats['active_jobs'] = count($runningJobs);
 
     foreach ($runningJobs as $jobId => &$job) {
-        $result = poll_command($job, $timeoutSignal);
+        $result = poll_command($job, $timeoutSignal, $onlyCrashes);
         if ($result === null) {
             continue;
         }
@@ -895,6 +913,7 @@ while (true) {
                 $maxSeconds,
                 $timeoutSignalArg,
                 $timeoutSignal,
+                $onlyCrashes,
                 $renderInterval,
                 $lastRenderTime
             );
