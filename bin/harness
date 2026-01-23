@@ -172,6 +172,11 @@ function two_column(string $left, string $right, int $width, int $gap = 3): stri
     return $left . str_repeat(' ', $gap) . $right;
 }
 
+function format_label_value(string $label, string $value, int $labelWidth = 12): string
+{
+    return str_pad($label, $labelWidth) . ': ' . $value;
+}
+
 function render_screen(array $stats, ?int $currentOps, string $mode): void
 {
     $width = terminal_width();
@@ -187,24 +192,42 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $lines[] = pad_line(str_pad($title, $width, ' ', STR_PAD_BOTH), $width);
     $lines[] = str_repeat('-', $width);
     $activeJobs = $stats['active_jobs'] ?? 1;
-    $lines[] = two_column("Elapsed: {$elapsed}", 'Runs: ' . number_format($stats['runs']), $width);
-    $lines[] = two_column("Jobs: {$activeJobs}", 'Reproducers: ' . number_format($stats['reproducers']), $width);
-    $lines[] = two_column("Last failure: {$sinceFailure}", 'Reductions: ' . number_format($stats['reductions']), $width);
+    $lines[] = two_column(
+        format_label_value('Elapsed', $elapsed),
+        format_label_value('Runs', number_format($stats['runs'])),
+        $width
+    );
+    $lines[] = two_column(
+        format_label_value('Jobs', (string)$activeJobs),
+        format_label_value('Reproducers', number_format($stats['reproducers'])),
+        $width
+    );
+    $lines[] = two_column(
+        format_label_value('Last failure', $sinceFailure),
+        format_label_value('Reductions', number_format($stats['reductions'])),
+        $width
+    );
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
-    $lines[] = two_column("Ops: {$opsLabel}", "Mode: {$mode}", $width);
+    $lines[] = two_column(
+        format_label_value('Ops', $opsLabel),
+        format_label_value('Mode', $mode),
+        $width
+    );
     $memoryLine = 'Relay mem: n/a';
     $relayMemory = $stats['relay_memory'] ?? null;
     if (is_array($relayMemory)) {
         $used = format_bytes((int)($relayMemory['used'] ?? 0));
         $total = format_bytes((int)($relayMemory['total'] ?? 0));
-        $active = format_bytes((int)($relayMemory['active'] ?? 0));
-        $limit = format_bytes((int)($relayMemory['limit'] ?? 0));
-        $memoryLine = "Relay mem: {$used}/{$total} (active {$active}, limit {$limit})";
+        $memoryLine = "Relay mem: {$used}/{$total}";
     }
     $lines[] = pad_line($memoryLine, $width);
     $lastFailure = $stats['last_failure_summary'] !== '' ? $stats['last_failure_summary'] : 'none';
     $event = $stats['last_event'] !== '' ? $stats['last_event'] : 'none';
-    $lines[] = two_column("Last crash: {$lastFailure}", "Event: {$event}", $width);
+    $lines[] = two_column(
+        format_label_value('Last crash', $lastFailure),
+        format_label_value('Event', $event),
+        $width
+    );
     $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
     $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
     $lines[] = str_repeat('-', $width);
