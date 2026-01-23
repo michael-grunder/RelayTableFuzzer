@@ -19,6 +19,10 @@ Quick examples for running the fuzzer utilities in this repo.
 ```
 
 ```bash
+./bin/fuzzer --mode=script:random --ops 1000 --seed 4242 --workers 1 > /tmp/relay-fuzzer.php
+```
+
+```bash
 php /tmp/relay-fuzzer.php
 ```
 

@@ -13,7 +13,7 @@ final class ScriptGenerator
     ) {
     }
 
-    public function generate(Options $options): string
+    public function generate(Options $options, array $contextLines = []): string
     {
         $lines = [];
         $lines[] = '#!/usr/bin/env php';
@@ -23,6 +23,17 @@ final class ScriptGenerator
         $lines[] = '';
         $lines[] = 'use Relay\\Table;';
         $lines[] = '';
+        if ($contextLines !== []) {
+            foreach ($contextLines as $line) {
+                $line = rtrim((string) $line);
+                if ($line === '') {
+                    $lines[] = '//';
+                    continue;
+                }
+                $lines[] = '// ' . $line;
+            }
+            $lines[] = '';
+        }
         $lines[] = sprintf('// seed: %d (%s)', $options->seed, $options->seedSource);
         $lines[] = sprintf(
             '// ops: %d, workers: %d, keys: %d, max-key-size: %d, max-mems: %d, mode: %s',

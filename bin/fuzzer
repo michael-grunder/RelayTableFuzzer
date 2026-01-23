@@ -8,6 +8,7 @@ use Mgrunder\RelayTableFuzzer\Console\OptionParser;
 use Mgrunder\RelayTableFuzzer\Console\Usage;
 use Mgrunder\RelayTableFuzzer\FuzzerRunner;
 use Mgrunder\RelayTableFuzzer\LoggerFactory;
+use Mgrunder\RelayTableFuzzer\ScriptGenerator;
 use Psr\Log\InvalidArgumentException;
 use Relay\Relay;
 use Throwable;
@@ -36,11 +37,47 @@ if (isset($options['help']) || !isset($options['ops'])) {
     exit(isset($options['ops']) ? 0 : 1);
 }
 
+$rawMode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'random';
+$emitScript = false;
+if (str_starts_with($rawMode, 'script')) {
+    $emitScript = true;
+    $scriptMode = 'random';
+    if ($rawMode !== 'script') {
+        if (str_starts_with($rawMode, 'script:')) {
+            $scriptMode = substr($rawMode, strlen('script:'));
+        } else {
+            fwrite(STDERR, "Invalid --mode: {$rawMode}\n");
+            exit(1);
+        }
+    }
+    if ($scriptMode === '') {
+        $scriptMode = 'random';
+    }
+    if (!in_array($scriptMode, ['random', 'queue'], true)) {
+        fwrite(STDERR, "Invalid --mode: {$rawMode}\n");
+        exit(1);
+    }
+    $options['mode'] = $scriptMode;
+}
+
 try {
     $parsed = OptionParser::parse($options, $argv[0]);
 } catch (RuntimeException $e) {
     fwrite(STDERR, $e->getMessage() . "\n");
     exit(1);
+}
+
+if ($emitScript) {
+    $contextLines = [];
+    $contextRaw = getenv('RELAY_FUZZER_CONTEXT');
+    if (is_string($contextRaw) && trim($contextRaw) !== '') {
+        $contextLines = preg_split("/\r?\n/", trim($contextRaw)) ?: [];
+    }
+    $contextLines[] = 'fuzzer args: ' . $parsed->rerunCommand;
+    $generator = new ScriptGenerator(new CommandGenerator());
+    $script = $generator->generate($parsed, $contextLines);
+    fwrite(STDOUT, $script);
+    exit(0);
 }
 
 try {
