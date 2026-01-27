@@ -776,6 +776,38 @@ function find_gdb_binary(): ?string
     return $path !== '' ? $path : null;
 }
 
+function run_gdb_backtrace(string $gdb, string $phpPath, string $coreFile, string $tracePath, string $command): void
+{
+    $descriptorSpec = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['file', $tracePath, 'w'],
+        2 => ['file', $tracePath . '.err', 'w'],
+    ];
+    $gdbCommand = [
+        $gdb,
+        '-batch',
+        '-ex',
+        'set pagination off',
+        '-ex',
+        $command,
+        $phpPath,
+        $coreFile,
+    ];
+    $process = proc_open($gdbCommand, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        file_put_contents($tracePath, "failed to start gdb\n");
+        return;
+    }
+
+    $status = proc_get_status($process);
+    while (($status['running'] ?? false) === true) {
+        usleep(10000);
+        $status = proc_get_status($process);
+    }
+
+    proc_close($process);
+}
+
 function generate_gdb_backtraces(array $coreFiles, string $destinationDir, string $phpBin): void
 {
     if ($coreFiles === []) {
@@ -788,46 +820,23 @@ function generate_gdb_backtraces(array $coreFiles, string $destinationDir, strin
     $suffix = count($coreFiles) > 1;
     foreach ($coreFiles as $coreFile) {
         $base = basename($coreFile);
-        $tracePath = $destinationDir . '/' . ($suffix ? "gdb-backtrace-{$base}.txt" : 'gdb-backtrace.txt');
+        $fullTracePath = $destinationDir . '/' . ($suffix ? "gdb-backtrace-{$base}.txt" : 'gdb-backtrace.txt');
+        $simpleTracePath = $destinationDir . '/' . ($suffix ? "gdb-backtrace-simple-{$base}.txt" : 'gdb-backtrace-simple.txt');
 
         if ($gdb === null) {
-            file_put_contents($tracePath, "gdb not found in PATH\n");
+            file_put_contents($fullTracePath, "gdb not found in PATH\n");
+            file_put_contents($simpleTracePath, "gdb not found in PATH\n");
             continue;
         }
 
         if ($phpPath === null) {
-            file_put_contents($tracePath, "php binary not found for gdb\n");
+            file_put_contents($fullTracePath, "php binary not found for gdb\n");
+            file_put_contents($simpleTracePath, "php binary not found for gdb\n");
             continue;
         }
 
-        $descriptorSpec = [
-            0 => ['file', '/dev/null', 'r'],
-            1 => ['file', $tracePath, 'w'],
-            2 => ['file', $tracePath . '.err', 'w'],
-        ];
-        $command = [
-            $gdb,
-            '-batch',
-            '-ex',
-            'set pagination off',
-            '-ex',
-            'thread apply all bt full',
-            $phpPath,
-            $coreFile,
-        ];
-        $process = proc_open($command, $descriptorSpec, $pipes);
-        if (!is_resource($process)) {
-            file_put_contents($tracePath, "failed to start gdb\n");
-            continue;
-        }
-
-        $status = proc_get_status($process);
-        while (($status['running'] ?? false) === true) {
-            usleep(10000);
-            $status = proc_get_status($process);
-        }
-
-        proc_close($process);
+        run_gdb_backtrace($gdb, $phpPath, $coreFile, $fullTracePath, 'thread apply all bt full');
+        run_gdb_backtrace($gdb, $phpPath, $coreFile, $simpleTracePath, 'thread apply all bt');
     }
 }
 
