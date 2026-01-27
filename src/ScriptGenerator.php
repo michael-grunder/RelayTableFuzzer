@@ -16,7 +16,6 @@ final class ScriptGenerator
     public function generate(Options $options, array $contextLines = []): string
     {
         $lines = [];
-        $lines[] = '#!/usr/bin/env php';
         $lines[] = '<?php';
         $lines[] = '';
         $lines[] = 'declare(strict_types=1);';
