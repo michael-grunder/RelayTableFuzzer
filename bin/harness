@@ -1417,13 +1417,12 @@ while (true) {
 
         if ($reduce && $finalOps !== null && $reproducerCrash) {
             $currentOps = $finalOps;
-            $crashResult = null;
-            $crashJob = null;
-            $stopAfterCrash = false;
-            continue;
         }
 
-        exit(1);
+        $crashResult = null;
+        $crashJob = null;
+        $stopAfterCrash = false;
+        continue;
     }
 
     if (!$progress) {
