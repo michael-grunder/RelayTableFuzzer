@@ -916,6 +916,22 @@ function move_output_files(array $result, string $destinationDir): array
     return $moved;
 }
 
+function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $reproduced): string
+{
+    $bucket = $reproduced ? 'reproducing' : 'non-reproducing';
+    $bucketDir = $reproducersDir . '/' . $bucket;
+    if (!is_dir($bucketDir)) {
+        mkdir($bucketDir, 0777, true);
+    }
+
+    $targetDir = $bucketDir . '/' . basename($jobDir);
+    if (@rename($jobDir, $targetDir)) {
+        return $targetDir;
+    }
+
+    return $jobDir;
+}
+
 function parse_relay_memory_from_output(?string $stdoutPath): ?array
 {
     if (!is_string($stdoutPath) || $stdoutPath === '' || !is_file($stdoutPath)) {
@@ -1359,9 +1375,36 @@ while (true) {
         $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
         generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
+        $reproducerScript = $jobDir . '/reproducer.php';
+        $reproducerCrash = false;
+        if (is_file($reproducerScript)) {
+            $stats['last_event'] = 'running reproducer';
+            $reproducerCommand = array_merge(
+                [$phpBin],
+                $phpIni !== null ? ['-c', $phpIni] : [],
+                [$reproducerScript]
+            );
+            $reproducerResult = run_command(
+                $reproducerCommand,
+                $phpBin,
+                $maxSeconds,
+                $timeoutSignalArg,
+                $timeoutSignal,
+                $onlyCrashes
+            );
+            $reproducerCrash = $reproducerResult['is_crash'];
+            if (!empty($reproducerResult['core_files'])) {
+                $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
+                generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+            }
+            cleanup_output_files($reproducerResult);
+        }
+
+        $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
+
         $stats['reproducers']++;
-        $stats['last_event'] = "reproducer saved: {$jobDir}";
-        $stats['last_reproducer'] = $jobDir;
+        $stats['last_event'] = "reproducer saved: {$finalJobDir}";
+        $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
         maybe_render_screen(
             $stats,
@@ -1372,7 +1415,7 @@ while (true) {
             true
         );
 
-        if ($reduce && $finalOps !== null) {
+        if ($reduce && $finalOps !== null && $reproducerCrash) {
             $currentOps = $finalOps;
             $crashResult = null;
             $crashJob = null;
