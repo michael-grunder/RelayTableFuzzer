@@ -18,6 +18,7 @@ final class OptionParser
         $ops = (int) $options['ops'];
         $seed = isset($options['seed']) ? (int) $options['seed'] : (int) hrtime(true);
         $keys = isset($options['keys']) ? (int) $options['keys'] : 16;
+        $namespaces = isset($options['namespaces']) ? (int) $options['namespaces'] : 1;
         $maxKeySize = isset($options['max-key-size']) ? (int) $options['max-key-size'] : 24;
         $maxMems = isset($options['max-mems']) ? (int) $options['max-mems'] : 4;
         $mode = isset($options['mode']) ? strtolower((string) $options['mode']) : 'random';
@@ -26,8 +27,8 @@ final class OptionParser
         $logLevel = isset($options['log-level']) ? strtolower((string) $options['log-level']) : 'info';
         $statusInterval = isset($options['status-interval']) ? (float) $options['status-interval'] : 1.0;
 
-        if ($ops <= 0 || $keys <= 0 || $maxKeySize <= 0 || $maxMems <= 0 || $workers < 0 || $statusInterval <= 0) {
-            throw new RuntimeException('Invalid --ops, --keys, --max-key-size, --max-mems, --workers, or --status-interval value.');
+        if ($ops <= 0 || $keys <= 0 || $namespaces <= 0 || $maxKeySize <= 0 || $maxMems <= 0 || $workers < 0 || $statusInterval <= 0) {
+            throw new RuntimeException('Invalid --ops, --keys, --namespaces, --max-key-size, --max-mems, --workers, or --status-interval value.');
         }
 
         $includeRaw = isset($options['include']) ? (string) $options['include'] : '';
@@ -48,7 +49,6 @@ final class OptionParser
             throw new RuntimeException('No operations selected after include/exclude filtering.');
         }
 
-        $namespace = 'fuzz:' . $seed;
         $seedSource = isset($options['seed']) ? 'provided' : 'generated';
         $rerunCommand = self::buildRerunCommand(
             $invocation,
@@ -56,6 +56,7 @@ final class OptionParser
             $seed,
             $workers,
             $keys,
+            $namespaces,
             $maxKeySize,
             $maxMems,
             $mode,
@@ -73,6 +74,7 @@ final class OptionParser
             $ops,
             $seed,
             $keys,
+            $namespaces,
             $maxKeySize,
             $maxMems,
             $mode,
@@ -83,7 +85,6 @@ final class OptionParser
             $include,
             $exclude,
             $opSet,
-            $namespace,
             $seedSource,
             $rerunCommand,
             $includeRaw,
@@ -106,6 +107,7 @@ final class OptionParser
         int $seed,
         int $workers,
         int $keys,
+        int $namespaces,
         int $maxKeySize,
         int $maxMems,
         string $mode,
@@ -123,6 +125,7 @@ final class OptionParser
             '--seed', (string) $seed,
             '--workers', (string) $workers,
             '--keys', (string) $keys,
+            '--namespaces', (string) $namespaces,
             '--max-key-size', (string) $maxKeySize,
             '--max-mems', (string) $maxMems,
             '--mode', $mode,

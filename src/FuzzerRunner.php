@@ -73,11 +73,12 @@ final class FuzzerRunner
             $cmd = $this->generator->generate(
                 $options->opSet,
                 $options->keys,
+                $options->namespaces,
                 $options->maxKeySize,
                 $options->maxMems
             );
             try {
-                $this->executeCommand($options->namespace, $cmd, $logger, $workerId);
+                $this->executeCommand($cmd, $logger, $workerId);
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
             }
@@ -127,6 +128,7 @@ final class FuzzerRunner
             $cmd = $this->generator->generate(
                 $options->opSet,
                 $options->keys,
+                $options->namespaces,
                 $options->maxKeySize,
                 $options->maxMems
             );
@@ -178,7 +180,7 @@ final class FuzzerRunner
                 continue;
             }
             try {
-                $this->executeCommand($options->namespace, $cmd, $logger, $workerId);
+                $this->executeCommand($cmd, $logger, $workerId);
             } catch (Throwable $e) {
                 fwrite(STDERR, "worker {$workerId} error: {$e->getMessage()}\n");
             }
@@ -209,9 +211,10 @@ final class FuzzerRunner
         ));
     }
 
-    private function executeCommand(string $namespace, array $cmd, Logger $logger, int $workerId): void
+    private function executeCommand(array $cmd, Logger $logger, int $workerId): void
     {
         $op = $cmd['op'] ?? '';
+        $namespace = $cmd['namespace'] ?? '';
         $logger->debug('Executing command', [
             'worker' => $workerId,
             'cmd' => $cmd,

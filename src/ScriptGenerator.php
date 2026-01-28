@@ -43,9 +43,7 @@ final class ScriptGenerator
             $options->maxMems,
             $options->mode
         );
-        $lines[] = sprintf('// namespace: %s', $options->namespace);
-        $lines[] = '';
-        $lines[] = sprintf('$namespace = %s;', var_export($options->namespace, true));
+        $lines[] = sprintf('// namespaces: %d', $options->namespaces);
         $lines[] = '';
 
         if ($options->mode === 'queue') {
@@ -68,6 +66,7 @@ final class ScriptGenerator
             $cmd = $this->generator->generate(
                 $options->opSet,
                 $options->keys,
+                $options->namespaces,
                 $options->maxKeySize,
                 $options->maxMems
             );
@@ -85,6 +84,7 @@ final class ScriptGenerator
                 $cmd = $this->generator->generate(
                     $options->opSet,
                     $options->keys,
+                    $options->namespaces,
                     $options->maxKeySize,
                     $options->maxMems
                 );
@@ -97,26 +97,40 @@ final class ScriptGenerator
     private function commandToPhp(array $cmd): string
     {
         $op = $cmd['op'] ?? '';
+        $namespace = $cmd['namespace'] ?? '';
 
         switch ($op) {
             case 'get':
-                return sprintf('Table::get(%s, $namespace);', var_export((string) $cmd['key'], true));
+                return sprintf('Table::get(%s, %s);',
+                    var_export((string) $cmd['key'], true),
+                    var_export((string) $namespace, true)
+                );
             case 'set':
-                return sprintf('Table::set(%s, %s, %s, $namespace);',
+                return sprintf('Table::set(%s, %s, %s, %s);',
                     var_export((string) $cmd['key'], true),
                     var_export($cmd['value'] ?? null, true),
-                    var_export($cmd['expire'] ?? null, true)
+                    var_export($cmd['expire'] ?? null, true),
+                    var_export((string) $namespace, true)
                 );
             case 'exists':
-                return sprintf('Table::exists(%s, $namespace);', var_export((string) $cmd['key'], true));
+                return sprintf('Table::exists(%s, %s);',
+                    var_export((string) $cmd['key'], true),
+                    var_export((string) $namespace, true)
+                );
             case 'delete':
-                return sprintf('Table::delete(%s, $namespace);', var_export((string) $cmd['key'], true));
+                return sprintf('Table::delete(%s, %s);',
+                    var_export((string) $cmd['key'], true),
+                    var_export((string) $namespace, true)
+                );
             case 'ttl':
-                return sprintf('Table::ttl(%s, $namespace);', var_export((string) $cmd['key'], true));
+                return sprintf('Table::ttl(%s, %s);',
+                    var_export((string) $cmd['key'], true),
+                    var_export((string) $namespace, true)
+                );
             case 'count':
-                return 'Table::count($namespace);';
+                return sprintf('Table::count(%s);', var_export((string) $namespace, true));
             case 'clear':
-                return 'Table::clear($namespace);';
+                return sprintf('Table::clear(%s);', var_export((string) $namespace, true));
             case 'namespaces':
                 return 'Table::namespaces();';
             case 'clearAll':

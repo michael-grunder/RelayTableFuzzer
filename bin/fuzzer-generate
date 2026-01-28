@@ -15,6 +15,7 @@ $options = getopt('', [
     'seed:',
     'ops:',
     'keys:',
+    'namespaces:',
     'max-key-size:',
     'max-mems:',
     'include:',

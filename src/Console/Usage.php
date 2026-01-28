@@ -13,7 +13,7 @@ Relay Table fuzzer
 
 Usage:
   ./bin/fuzzer --ops N [--workers N] [--seed INT] [--keys N]
-               [--max-key-size N] [--max-mems N]
+               [--namespaces N] [--max-key-size N] [--max-mems N]
                [--include csl] [--exclude csl]
                [--mode random|queue|script[:random|queue]] [--redis host:port] [--list name]
                [--log-level level] [--status-interval SECONDS]
@@ -36,7 +36,7 @@ Relay Table fuzzer script generator
 
 Usage:
   ./bin/fuzzer-generate --ops N [--workers N] [--seed INT] [--keys N]
-                        [--max-key-size N] [--max-mems N]
+                        [--namespaces N] [--max-key-size N] [--max-mems N]
                         [--include csl] [--exclude csl]
                         [--mode random|queue]
 

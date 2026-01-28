@@ -19,6 +19,7 @@ $options = getopt('', [
     'seed:',
     'ops:',
     'keys:',
+    'namespaces:',
     'max-key-size:',
     'max-mems:',
     'include:',
@@ -93,9 +94,9 @@ $logger->info('Fuzzer run configuration', [
     'seed_source' => $parsed->seedSource,
     'workers' => $parsed->workers,
     'keys' => $parsed->keys,
+    'namespaces' => $parsed->namespaces,
     'max_key_size' => $parsed->maxKeySize,
     'max_mems' => $parsed->maxMems,
-    'namespace' => $parsed->namespace,
     'include' => $parsed->include,
     'exclude' => $parsed->exclude,
     'op_set' => $parsed->opSet,
@@ -111,9 +112,9 @@ fwrite(STDOUT, sprintf("workers: %d\n", $parsed->workers));
 fwrite(STDOUT, sprintf("mode: %s\n", $parsed->mode));
 fwrite(STDOUT, sprintf("seed: %d (%s)\n", $parsed->seed, $parsed->seedSource));
 fwrite(STDOUT, sprintf("keys: %d\n", $parsed->keys));
+fwrite(STDOUT, sprintf("namespaces: %d\n", $parsed->namespaces));
 fwrite(STDOUT, sprintf("max key size: %d\n", $parsed->maxKeySize));
 fwrite(STDOUT, sprintf("max mems: %d\n", $parsed->maxMems));
-fwrite(STDOUT, sprintf("namespace: %s\n", $parsed->namespace));
 if ($parsed->include !== []) {
     fwrite(STDOUT, sprintf("include: %s\n", implode(',', $parsed->include)));
 }

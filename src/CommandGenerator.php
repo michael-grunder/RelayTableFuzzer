@@ -6,7 +6,7 @@ namespace Mgrunder\RelayTableFuzzer;
 
 final class CommandGenerator
 {
-    public function generate(array $ops, int $keys, int $maxKeySize, int $maxMems): array
+    public function generate(array $ops, int $keys, int $namespaces, int $maxKeySize, int $maxMems): array
     {
         $op = $ops[mt_rand(0, count($ops) - 1)];
         $cmd = ['op' => $op];
@@ -37,6 +37,11 @@ final class CommandGenerator
                 break;
         }
 
+        $effectiveOp = $cmd['op'] ?? $op;
+        if (!in_array($effectiveOp, ['namespaces', 'clearAll'], true)) {
+            $cmd['namespace'] = $this->pickNamespace($namespaces);
+        }
+
         return $cmd;
     }
 
@@ -44,6 +49,12 @@ final class CommandGenerator
     {
         $idx = mt_rand(0, $keys - 1);
         return 'key:' . $idx;
+    }
+
+    private function pickNamespace(int $namespaces): string
+    {
+        $idx = mt_rand(0, $namespaces - 1);
+        return 'namespace:' . $idx;
     }
 
     private function randomValue(int $maxKeySize, int $maxMems): mixed
