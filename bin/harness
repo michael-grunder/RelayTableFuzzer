@@ -181,6 +181,52 @@ function format_label_value(string $label, string $value, int $labelWidth = 12):
     return str_pad($label, $labelWidth) . ': ' . $value;
 }
 
+function count_reproducer_dirs(string $reproducersDir): array
+{
+    if (!is_dir($reproducersDir)) {
+        return ['total' => 0, 'reproducing' => 0];
+    }
+
+    $total = 0;
+    $reproducing = 0;
+    $entries = scandir($reproducersDir);
+    if ($entries === false) {
+        return ['total' => 0, 'reproducing' => 0];
+    }
+
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $dir = $reproducersDir . '/' . $entry;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        if ($entry === 'reproducing' || $entry === 'non-reproducing') {
+            $subEntries = scandir($dir);
+            if ($subEntries === false) {
+                continue;
+            }
+            foreach ($subEntries as $subEntry) {
+                if ($subEntry === '.' || $subEntry === '..') {
+                    continue;
+                }
+                if (!is_dir($dir . '/' . $subEntry)) {
+                    continue;
+                }
+                $total++;
+                if ($entry === 'reproducing') {
+                    $reproducing++;
+                }
+            }
+            continue;
+        }
+        $total++;
+    }
+
+    return ['total' => $total, 'reproducing' => $reproducing];
+}
+
 function render_screen(array $stats, ?int $currentOps, string $mode): void
 {
     $width = terminal_width();
@@ -197,6 +243,9 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     $lines[] = str_repeat('-', $width);
     $activeJobs = $stats['active_jobs'] ?? 1;
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
+    $reproducersTotal = $stats['reproducers'] ?? 0;
+    $reproducersReproducing = $stats['reproducers_reproducing'] ?? 0;
+    $reproducersLabel = number_format($reproducersTotal) . ' (' . number_format($reproducersReproducing) . ' reproducing)';
     $pairs = [
         [
             format_label_value('Elapsed', $elapsed),
@@ -204,7 +253,7 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         ],
         [
             format_label_value('Jobs', (string)$activeJobs),
-            format_label_value('Reproducers', number_format($stats['reproducers'])),
+            format_label_value('Reproducers', $reproducersLabel),
         ],
         [
             format_label_value('Last failure', $sinceFailure),
@@ -1162,12 +1211,14 @@ $reproducersDir = __DIR__ . '/../reproducers';
 if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
 }
+$reproducerCounts = count_reproducer_dirs($reproducersDir);
 
 $currentOps = $ops;
 $stats = [
     'start_time' => microtime(true),
     'runs' => 0,
-    'reproducers' => 0,
+    'reproducers' => $reproducerCounts['total'],
+    'reproducers_reproducing' => $reproducerCounts['reproducing'],
     'last_failure_time' => null,
     'last_failure_summary' => '',
     'reductions' => 0,
@@ -1403,6 +1454,9 @@ while (true) {
         $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
 
         $stats['reproducers']++;
+        if ($reproducerCrash) {
+            $stats['reproducers_reproducing']++;
+        }
         $stats['last_event'] = "reproducer saved: {$finalJobDir}";
         $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
