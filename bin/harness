@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments:
   {range}            -> random integer
@@ -1017,6 +1017,40 @@ function parse_relay_memory_from_output(?string $stdoutPath): ?array
     return null;
 }
 
+function parse_php_leak_count_from_file(?string $path): ?int
+{
+    if (!is_string($path) || $path === '' || !is_file($path)) {
+        return null;
+    }
+
+    $lines = @file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return null;
+    }
+
+    for ($i = count($lines) - 1; $i >= 0; $i--) {
+        $line = trim($lines[$i]);
+        if ($line === '') {
+            continue;
+        }
+        if (preg_match('/^===\s*Total\s+(\d+)\s+memory\s+leaks\s+detected\s+===/i', $line, $matches)) {
+            return (int)$matches[1];
+        }
+    }
+
+    return null;
+}
+
+function parse_php_leak_count(?string $stdoutPath, ?string $stderrPath): ?int
+{
+    $count = parse_php_leak_count_from_file($stderrPath);
+    if ($count !== null) {
+        return $count;
+    }
+
+    return parse_php_leak_count_from_file($stdoutPath);
+}
+
 function build_failure_summary(array $result): string
 {
     if (!empty($result['timed_out'])) {
@@ -1057,6 +1091,7 @@ $phpIni = null;
 $ops = null;
 $reduce = false;
 $onlyCrashes = false;
+$capturePhpLeaks = false;
 $maxSeconds = null;
 $timeoutSignalArg = null;
 $timeoutSignal = null;
@@ -1099,6 +1134,11 @@ for ($i = 1; $i < $argc; $i++) {
 
     if ($arg === '--only-crashes') {
         $onlyCrashes = true;
+        continue;
+    }
+
+    if ($arg === '--capture-php-leaks') {
+        $capturePhpLeaks = true;
         continue;
     }
 
@@ -1212,6 +1252,10 @@ if (!is_dir($reproducersDir)) {
     mkdir($reproducersDir, 0777, true);
 }
 $reproducerCounts = count_reproducer_dirs($reproducersDir);
+$leaksDir = __DIR__ . '/../leaks';
+if (!is_dir($leaksDir)) {
+    mkdir($leaksDir, 0777, true);
+}
 
 $currentOps = $ops;
 $stats = [
@@ -1234,12 +1278,15 @@ $runningJobs = [];
 $crashResult = null;
 $crashJob = null;
 $stopAfterCrash = false;
+$leakResult = null;
+$leakJob = null;
+$stopAfterLeak = false;
 $lastRenderTime = 0.0;
 
 while (true) {
     $progress = false;
 
-    while (!$stopAfterCrash && count($runningJobs) < $jobs) {
+    while (!$stopAfterCrash && !$stopAfterLeak && count($runningJobs) < $jobs) {
         $jobCounter++;
         $job = create_job(
             $commandArgs,
@@ -1276,6 +1323,11 @@ while (true) {
             continue;
         }
 
+        $leakCount = null;
+        if ($capturePhpLeaks) {
+            $leakCount = parse_php_leak_count($result['stdout_path'], $result['stderr_path']);
+        }
+
         if (
             $result['exit_code'] === 0
             && $result['signal'] === null
@@ -1299,6 +1351,18 @@ while (true) {
             foreach ($runningJobs as &$pendingJob) {
                 cancel_command($pendingJob);
             }
+        } elseif ($leakCount !== null && $leakResult === null && !$result['is_crash']) {
+            $result['leak_count'] = $leakCount;
+            $leakResult = $result;
+            $leakJob = $job;
+            $stats['last_failure_time'] = microtime(true);
+            $stats['last_failure_summary'] = "LEAKS: {$leakCount}";
+            $stats['last_event'] = 'leak detected';
+            $stopAfterLeak = true;
+
+            foreach ($runningJobs as &$pendingJob) {
+                cancel_command($pendingJob);
+            }
         } else {
             cleanup_output_files($result);
         }
@@ -1310,7 +1374,7 @@ while (true) {
             $stopAfterCrash ? 'reducing' : 'fuzzing',
             $renderInterval,
             $lastRenderTime,
-            $result['is_crash']
+            $result['is_crash'] || $leakCount !== null
         );
     }
     unset($job);
@@ -1476,6 +1540,132 @@ while (true) {
         $crashResult = null;
         $crashJob = null;
         $stopAfterCrash = false;
+        continue;
+    }
+
+    if ($leakResult !== null && $runningJobs === []) {
+        $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
+        $jobDir = $leaksDir . '/' . $jobId;
+        mkdir($jobDir, 0777, true);
+
+        $finalCommand = $leakJob['command_string'];
+        $finalOps = $currentOps;
+        $dynamicArgs = $leakJob['dynamic_args'];
+
+        $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
+        file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+
+        $outputFiles = move_output_files($leakResult, $jobDir);
+        cleanup_output_files($leakResult);
+
+        $signal = $leakResult['signal'];
+        $exitCode = $leakResult['exit_code'];
+        $pid = $leakResult['pid'];
+        $leakCount = $leakResult['leak_count'] ?? null;
+
+        $signalLabel = $signal !== null ? signal_label($signal) : 'none';
+        $signalDesc = $signal !== null ? signal_description($signal) : '';
+        $exitName = !empty($leakResult['timed_out'])
+            ? 'TIMEOUT'
+            : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
+
+        $reportData = [
+            'command' => $finalCommand,
+            'exit_code' => $exitCode,
+            'exit_name' => $exitName,
+            'signal' => $signalLabel,
+        ];
+        if ($finalOps !== null) {
+            $reportData['ops'] = $finalOps;
+        }
+        if ($signalDesc !== '') {
+            $reportData['signal_desc'] = $signalDesc;
+        }
+        if (!empty($leakResult['timed_out'])) {
+            $reportData['timed_out'] = true;
+            if ($maxSeconds !== null) {
+                $reportData['max_seconds'] = $maxSeconds;
+            }
+            if (!empty($leakResult['timeout_signal'])) {
+                $reportData['timeout_signal'] = $leakResult['timeout_signal'];
+            }
+        }
+        $reportData['pid'] = $pid ?? 'unknown';
+        if ($leakCount !== null) {
+            $reportData['leak_count'] = $leakCount;
+        }
+        if (!empty($leakResult['core_files'])) {
+            $reportData['core_files'] = array_map('basename', $leakResult['core_files']);
+        }
+        if ($outputFiles !== []) {
+            $reportData['output_files'] = $outputFiles;
+        }
+
+        $report = [];
+        foreach ($reportData as $key => $value) {
+            if (is_array($value)) {
+                $value = implode(', ', $value);
+            } elseif (is_bool($value)) {
+                $value = $value ? 'yes' : 'no';
+            }
+            $report[] = "{$key}: {$value}";
+        }
+
+        file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
+        file_put_contents(
+            $jobDir . '/report.json',
+            json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+        );
+
+        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalRunArgs, $finalCommand);
+        $movedCores = move_core_dumps($leakResult['core_files'], $jobDir);
+        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
+
+        $reproducerScript = $jobDir . '/reproducer.php';
+        $reproducerLeak = false;
+        if (is_file($reproducerScript)) {
+            $stats['last_event'] = 'running leak reproducer';
+            $reproducerCommand = array_merge(
+                [$phpBin],
+                $phpIni !== null ? ['-c', $phpIni] : [],
+                [$reproducerScript]
+            );
+            $reproducerResult = run_command(
+                $reproducerCommand,
+                $phpBin,
+                $maxSeconds,
+                $timeoutSignalArg,
+                $timeoutSignal,
+                $onlyCrashes
+            );
+            $reproducerLeak = parse_php_leak_count(
+                $reproducerResult['stdout_path'],
+                $reproducerResult['stderr_path']
+            ) !== null;
+            if (!empty($reproducerResult['core_files'])) {
+                $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
+                generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+            }
+            cleanup_output_files($reproducerResult);
+        }
+
+        $finalJobDir = move_reproducer_dir($jobDir, $leaksDir, $reproducerLeak);
+
+        $stats['last_event'] = "leak saved: {$finalJobDir}";
+        $stats['last_reproducer'] = $finalJobDir;
+        $stats['active_jobs'] = 0;
+        maybe_render_screen(
+            $stats,
+            $currentOps,
+            $reduce ? 'reducing' : 'fuzzing',
+            $renderInterval,
+            $lastRenderTime,
+            true
+        );
+
+        $leakResult = null;
+        $leakJob = null;
+        $stopAfterLeak = false;
         continue;
     }
 

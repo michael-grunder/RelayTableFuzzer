@@ -1,0 +1,295 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): string
+{
+    return <<<TEXT
+Usage:
+  bin/final-reduce --php-bin /path/to/php --php-ini relay.ini reproducer.php
+
+Options:
+  --php-bin   Path to PHP binary (default: current PHP)
+  --php-ini   Path to php.ini (optional)
+  --help      Show this help
+
+TEXT;
+}
+
+function parse_script_paths(array $argv): array
+{
+    $args = $argv;
+    array_shift($args);
+    $scripts = [];
+    for ($i = 0; $i < count($args); $i++) {
+        $arg = $args[$i];
+        if ($arg === '--help') {
+            continue;
+        }
+        if (str_starts_with($arg, '--php-bin=')
+            || str_starts_with($arg, '--php-ini=')) {
+            continue;
+        }
+        if ($arg === '--php-bin' || $arg === '--php-ini') {
+            $i++;
+            continue;
+        }
+        if (str_starts_with($arg, '--')) {
+            continue;
+        }
+        $scripts[] = $arg;
+    }
+
+    return $scripts;
+}
+
+function comment_out_line(string $line): string
+{
+    $lineBreak = '';
+    $content = $line;
+    if (str_ends_with($line, "\r\n")) {
+        $lineBreak = "\r\n";
+        $content = substr($line, 0, -2);
+    } elseif (str_ends_with($line, "\n")) {
+        $lineBreak = "\n";
+        $content = substr($line, 0, -1);
+    }
+
+    $commented = preg_replace('/^(\\s*)/', '$1// ', $content, 1);
+    if ($commented === null) {
+        $commented = '// ' . $content;
+    }
+
+    return $commented . $lineBreak;
+}
+
+function build_script(array $lines, array $tableLineSet, array $activeLineSet): string
+{
+    $output = [];
+    foreach ($lines as $idx => $line) {
+        if (isset($tableLineSet[$idx])) {
+            $output[] = isset($activeLineSet[$idx]) ? $line : comment_out_line($line);
+            continue;
+        }
+        $output[] = $line;
+    }
+
+    return implode('', $output);
+}
+
+function write_temp_script(string $dir, string $contents): string
+{
+    $tmp = tempnam($dir, 'final-reduce-');
+    if ($tmp === false) {
+        throw new RuntimeException('Failed to create temp file');
+    }
+    $tmpPhp = $tmp . '.php';
+    if (!@rename($tmp, $tmpPhp)) {
+        @unlink($tmp);
+        throw new RuntimeException('Failed to create temp file');
+    }
+    if (file_put_contents($tmpPhp, $contents) === false) {
+        @unlink($tmpPhp);
+        throw new RuntimeException('Failed to write temp script');
+    }
+
+    return $tmpPhp;
+}
+
+function run_php(string $phpBin, ?string $phpIni, string $scriptPath, string $cwd): int
+{
+    $args = [$phpBin];
+    if ($phpIni !== null && $phpIni !== '') {
+        $args[] = '-c';
+        $args[] = $phpIni;
+    }
+    $args[] = $scriptPath;
+    $command = implode(' ', array_map('escapeshellarg', $args));
+
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    $pipes = [];
+    $proc = proc_open($command, $descriptors, $pipes, $cwd);
+    if (!is_resource($proc)) {
+        throw new RuntimeException('Failed to execute PHP binary');
+    }
+    fclose($pipes[0]);
+    stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($proc);
+
+    return is_int($exitCode) ? $exitCode : 1;
+}
+
+function is_crash(int $exitCode): bool
+{
+    return $exitCode >= 128;
+}
+
+function ddmin(array $ops, callable $test): array
+{
+    $n = 2;
+    $count = count($ops);
+    while ($count >= 2) {
+        $subsetSize = (int) ceil($count / $n);
+        $reduced = false;
+        for ($i = 0; $i < $n; $i++) {
+            $start = $i * $subsetSize;
+            if ($start >= $count) {
+                break;
+            }
+            $subset = array_slice($ops, $start, $subsetSize);
+            if ($subset === []) {
+                continue;
+            }
+            if ($test($subset)) {
+                $ops = $subset;
+                $count = count($ops);
+                $n = 2;
+                $reduced = true;
+                break;
+            }
+            $complement = array_values(array_diff($ops, $subset));
+            if ($complement === []) {
+                continue;
+            }
+            if ($test($complement)) {
+                $ops = $complement;
+                $count = count($ops);
+                $n = max($n - 1, 2);
+                $reduced = true;
+                break;
+            }
+        }
+        if (!$reduced) {
+            if ($n >= $count) {
+                break;
+            }
+            $n = min($n * 2, $count);
+        }
+    }
+
+    return $ops;
+}
+
+$options = getopt('', ['php-bin:', 'php-ini:', 'help']);
+if (isset($options['help'])) {
+    fwrite(STDOUT, usage());
+    exit(0);
+}
+
+$scriptPaths = parse_script_paths($argv);
+if ($scriptPaths === []) {
+    fwrite(STDERR, usage());
+    exit(1);
+}
+if (count($scriptPaths) > 1) {
+    fwrite(STDERR, "Only one script path is supported.\n");
+    exit(1);
+}
+
+$scriptPath = $scriptPaths[0];
+
+$scriptPath = realpath($scriptPath);
+if ($scriptPath === false || !is_file($scriptPath)) {
+    fwrite(STDERR, "Script not found: {$scriptPath}\n");
+    exit(1);
+}
+
+$phpBin = $options['php-bin'] ?? PHP_BINARY;
+$phpIni = $options['php-ini'] ?? null;
+if (!is_file($phpBin)) {
+    fwrite(STDERR, "PHP binary not found: {$phpBin}\n");
+    exit(1);
+}
+if ($phpIni !== null && $phpIni !== '' && !is_file($phpIni)) {
+    fwrite(STDERR, "PHP ini not found: {$phpIni}\n");
+    exit(1);
+}
+
+$lines = file($scriptPath);
+if ($lines === false) {
+    fwrite(STDERR, "Failed to read script: {$scriptPath}\n");
+    exit(1);
+}
+
+$tableLineIndexes = [];
+foreach ($lines as $idx => $line) {
+    if (preg_match('/^\\s*Table::/', $line) === 1) {
+        $tableLineIndexes[] = $idx;
+    }
+}
+
+if ($tableLineIndexes === []) {
+    fwrite(STDERR, "No Table:: operations found in script.\n");
+    exit(1);
+}
+
+$scriptDir = dirname($scriptPath);
+$tableLineSet = array_fill_keys($tableLineIndexes, true);
+$activeOps = $tableLineIndexes;
+$originalCount = count($activeOps);
+
+fwrite(STDOUT, "Final reduce starting\n");
+fwrite(STDOUT, "Script: {$scriptPath}\n");
+fwrite(STDOUT, "PHP bin: {$phpBin}\n");
+if ($phpIni !== null && $phpIni !== '') {
+    fwrite(STDOUT, "PHP ini: {$phpIni}\n");
+}
+fwrite(STDOUT, "Table operations: {$originalCount}\n");
+
+$testCount = 0;
+$test = function (array $candidateOps) use (
+    &$testCount,
+    $lines,
+    $tableLineSet,
+    $phpBin,
+    $phpIni,
+    $scriptDir
+): bool {
+    $testCount++;
+    $activeLineSet = array_fill_keys($candidateOps, true);
+    $contents = build_script($lines, $tableLineSet, $activeLineSet);
+    $tmpScript = write_temp_script($scriptDir, $contents);
+    $exitCode = run_php($phpBin, $phpIni, $tmpScript, $scriptDir);
+    @unlink($tmpScript);
+    $crash = is_crash($exitCode);
+    $result = $crash ? 'crash' : 'no crash';
+    fwrite(STDOUT, sprintf("test #%d: ops=%d => %s (exit %d)\n", $testCount, count($candidateOps), $result, $exitCode));
+
+    return $crash;
+};
+
+if (!$test($activeOps)) {
+    fwrite(STDERR, "Baseline did not crash; cannot reduce.\n");
+    exit(1);
+}
+
+$reducedOps = ddmin($activeOps, $test);
+$finalCount = count($reducedOps);
+
+if ($finalCount >= $originalCount) {
+    fwrite(STDOUT, "No reduction possible (still {$originalCount} operations).\n");
+    exit(0);
+}
+
+$finalSet = array_fill_keys($reducedOps, true);
+$finalContents = build_script($lines, $tableLineSet, $finalSet);
+$outputPath = preg_replace('/\\.php$/', '', $scriptPath) . '.final-reduced.php';
+if ($outputPath === null) {
+    $outputPath = $scriptPath . '.final-reduced.php';
+}
+
+if (file_put_contents($outputPath, $finalContents) === false) {
+    fwrite(STDERR, "Failed to write reduced script: {$outputPath}\n");
+    exit(1);
+}
+
+fwrite(STDOUT, sprintf("Reduced %d operations to %d operations.\n", $originalCount, $finalCount));
+fwrite(STDOUT, "Reduced script: {$outputPath}\n");
