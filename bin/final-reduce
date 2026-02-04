@@ -97,7 +97,7 @@ function write_temp_script(string $dir, string $contents): string
     return $tmpPhp;
 }
 
-function run_php(string $phpBin, ?string $phpIni, string $scriptPath, string $cwd): int
+function run_php(string $phpBin, ?string $phpIni, string $scriptPath, string $cwd): array
 {
     $args = [$phpBin];
     if ($phpIni !== null && $phpIni !== '') {
@@ -118,13 +118,39 @@ function run_php(string $phpBin, ?string $phpIni, string $scriptPath, string $cw
         throw new RuntimeException('Failed to execute PHP binary');
     }
     fclose($pipes[0]);
-    stream_get_contents($pipes[1]);
+    $stdout = stream_get_contents($pipes[1]);
     fclose($pipes[1]);
-    stream_get_contents($pipes[2]);
+    $stderr = stream_get_contents($pipes[2]);
     fclose($pipes[2]);
+    $status = proc_get_status($proc);
     $exitCode = proc_close($proc);
+    $finalExit = null;
+    $signal = null;
+    if (is_array($status)) {
+        if (!empty($status['signaled'])) {
+            $signal = $status['termsig'] ?? null;
+            if (is_int($signal)) {
+                $finalExit = 128 + $signal;
+            }
+        } elseif (isset($status['exitcode']) && is_int($status['exitcode']) && $status['exitcode'] !== -1) {
+            $finalExit = $status['exitcode'];
+        }
+    }
+    if ($finalExit === null && is_int($exitCode) && $exitCode !== -1) {
+        $finalExit = $exitCode;
+    }
+    if ($finalExit === null) {
+        $finalExit = 1;
+    }
 
-    return is_int($exitCode) ? $exitCode : 1;
+    return [
+        'command' => $command,
+        'cwd' => $cwd,
+        'exit_code' => $finalExit,
+        'signal' => $signal,
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+    ];
 }
 
 function is_crash(int $exitCode): bool
@@ -208,9 +234,17 @@ if (!is_file($phpBin)) {
     fwrite(STDERR, "PHP binary not found: {$phpBin}\n");
     exit(1);
 }
-if ($phpIni !== null && $phpIni !== '' && !is_file($phpIni)) {
+$resolvedBin = realpath($phpBin);
+if ($resolvedBin !== false) {
+    $phpBin = $resolvedBin;
+}
+if ($phpIni !== null && $phpIni !== '') {
+    $resolvedIni = realpath($phpIni);
+    if ($resolvedIni === false || !is_file($resolvedIni)) {
     fwrite(STDERR, "PHP ini not found: {$phpIni}\n");
     exit(1);
+    }
+    $phpIni = $resolvedIni;
 }
 
 $lines = file($scriptPath);
@@ -257,11 +291,26 @@ $test = function (array $candidateOps) use (
     $activeLineSet = array_fill_keys($candidateOps, true);
     $contents = build_script($lines, $tableLineSet, $activeLineSet);
     $tmpScript = write_temp_script($scriptDir, $contents);
-    $exitCode = run_php($phpBin, $phpIni, $tmpScript, $scriptDir);
+    $run = run_php($phpBin, $phpIni, $tmpScript, $scriptDir);
+    $exitCode = $run['exit_code'];
     @unlink($tmpScript);
     $crash = is_crash($exitCode);
     $result = $crash ? 'crash' : 'no crash';
-    fwrite(STDOUT, sprintf("test #%d: ops=%d => %s (exit %d)\n", $testCount, count($candidateOps), $result, $exitCode));
+    fwrite(
+        STDOUT,
+        sprintf(
+            "test #%d: ops=%d => %s (exit %d%s)\n",
+            $testCount,
+            count($candidateOps),
+            $result,
+            $exitCode,
+            $run['signal'] !== null ? sprintf(", signal %d", $run['signal']) : ''
+        )
+    );
+    if ($testCount === 1) {
+        fwrite(STDOUT, "Command: {$run['command']}\n");
+        fwrite(STDOUT, "Cwd: {$run['cwd']}\n");
+    }
 
     return $crash;
 };
