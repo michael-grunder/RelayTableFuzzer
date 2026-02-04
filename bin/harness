@@ -25,9 +25,9 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
 
-Dynamic replacements in command arguments:
+Dynamic replacements in command arguments and -d values:
   {range}            -> random integer
   {range(lo,hi)}     -> random integer between lo and hi (inclusive)
   {hrtime}           -> hrtime(true)
@@ -87,6 +87,12 @@ function apply_ops(string $arg, ?int $ops): string
     }
 
     return str_replace('{ops}', (string)$ops, $arg);
+}
+
+function build_php_command(string $phpBin, ?string $phpIni, array $phpArgs, array $runArgs): array
+{
+    $iniArgs = ($phpIni !== null && $phpIni !== '') ? ['-c', $phpIni] : [];
+    return array_merge([$phpBin], $iniArgs, $phpArgs, $runArgs);
 }
 
 function format_duration(int $seconds): string
@@ -601,18 +607,21 @@ function create_job(
     ?int $currentOps,
     string $phpBin,
     ?string $phpIni,
+    array $phpArgs,
     int $jobId,
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
     ?int $timeoutSignal
 ): array {
     $dynamicArgs = array_map('replace_dynamic', $commandArgs);
+    $dynamicPhpArgs = array_map('replace_dynamic', $phpArgs);
     $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
-    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+    $fullCommand = build_php_command($phpBin, $phpIni, $dynamicPhpArgs, $runArgs);
 
     $job = start_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal);
     $job['id'] = $jobId;
     $job['dynamic_args'] = $dynamicArgs;
+    $job['php_args'] = $dynamicPhpArgs;
     $job['full_command'] = $fullCommand;
     $job['command_string'] = render_command(wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg));
     $job['ops'] = $currentOps;
@@ -684,6 +693,7 @@ function generate_reproducer_script(
     string $jobDir,
     string $phpBin,
     ?string $phpIni,
+    array $phpArgs,
     array $runArgs,
     string $finalCommand
 ): void {
@@ -692,7 +702,7 @@ function generate_reproducer_script(
     }
 
     [$scriptArgs, $mode] = build_script_mode_args($runArgs);
-    $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $scriptArgs);
+    $fullCommand = build_php_command($phpBin, $phpIni, $phpArgs, $scriptArgs);
     $scriptPath = $jobDir . '/reproducer.php';
     $stderrPath = $jobDir . '/reproducer-generate.stderr';
 
@@ -706,6 +716,9 @@ function generate_reproducer_script(
     ];
     if ($phpIni !== null && $phpIni !== '') {
         $contextLines[] = 'php ini: ' . $phpIni;
+    }
+    if ($phpArgs !== []) {
+        $contextLines[] = 'php args: ' . render_command($phpArgs);
     }
 
     $env = getenv();
@@ -739,11 +752,7 @@ function generate_reproducer_script(
     }
 
     $runnerPath = $jobDir . '/run-reproducer.sh';
-    $runnerCommand = array_merge(
-        [$phpBin],
-        ($phpIni !== null && $phpIni !== '') ? ['-c', $phpIni] : [],
-        ['reproducer.php']
-    );
+    $runnerCommand = build_php_command($phpBin, $phpIni, $phpArgs, ['reproducer.php']);
     $runnerLines = [
         '#!/usr/bin/env sh',
         '',
@@ -764,6 +773,7 @@ function reduce_ops(
     array $dynamicArgs,
     string $phpBin,
     ?string $phpIni,
+    array $phpArgs,
     array &$stats,
     string $jobDir,
     ?int $maxSeconds,
@@ -779,7 +789,7 @@ function reduce_ops(
     while ($low < $high) {
         $mid = intdiv($low + $high, 2);
         $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $mid), $dynamicArgs);
-        $fullCommand = array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $runArgs);
+        $fullCommand = build_php_command($phpBin, $phpIni, $phpArgs, $runArgs);
         $commandString = render_command(wrap_timeout_command($fullCommand, $maxSeconds, $timeoutSignalArg));
 
         $result = run_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $onlyCrashes);
@@ -1088,6 +1098,7 @@ $argc = $_SERVER['argc'];
 
 $phpBin = null;
 $phpIni = null;
+$phpArgs = [];
 $ops = null;
 $reduce = false;
 $onlyCrashes = false;
@@ -1118,6 +1129,30 @@ for ($i = 1; $i < $argc; $i++) {
 
     if ($arg === '--php-ini') {
         $phpIni = $argv[++$i] ?? null;
+        continue;
+    }
+
+    if ($arg === '-d') {
+        $value = $argv[++$i] ?? null;
+        if ($value === null || $value === '') {
+            fwrite(STDERR, "-d requires a non-empty ini=value\n");
+            fwrite(STDERR, usage($argv[0]) . "\n");
+            exit(1);
+        }
+        $phpArgs[] = '-d';
+        $phpArgs[] = $value;
+        continue;
+    }
+
+    if (str_starts_with($arg, '-d')) {
+        $value = substr($arg, 2);
+        if ($value === '') {
+            fwrite(STDERR, "-d requires a non-empty ini=value\n");
+            fwrite(STDERR, usage($argv[0]) . "\n");
+            exit(1);
+        }
+        $phpArgs[] = '-d';
+        $phpArgs[] = $value;
         continue;
     }
 
@@ -1293,6 +1328,7 @@ while (true) {
             $currentOps,
             $phpBin,
             $phpIni,
+            $phpArgs,
             $jobCounter,
             $maxSeconds,
             $timeoutSignalArg,
@@ -1395,6 +1431,7 @@ while (true) {
         $finalCommand = $crashJob['command_string'];
         $finalOps = $currentOps;
         $dynamicArgs = $crashJob['dynamic_args'];
+        $finalPhpArgs = $crashJob['php_args'] ?? [];
 
         if ($reduce && $currentOps !== null) {
             $stats['reductions']++;
@@ -1404,6 +1441,7 @@ while (true) {
                 $dynamicArgs,
                 $phpBin,
                 $phpIni,
+                $finalPhpArgs,
                 $stats,
                 $jobDir,
                 $maxSeconds,
@@ -1415,7 +1453,7 @@ while (true) {
             );
             $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
             $finalCommand = render_command(wrap_timeout_command(
-                array_merge([$phpBin], $phpIni !== null ? ['-c', $phpIni] : [], $reducedArgs),
+                build_php_command($phpBin, $phpIni, $finalPhpArgs, $reducedArgs),
                 $maxSeconds,
                 $timeoutSignalArg
             ));
@@ -1486,7 +1524,7 @@ while (true) {
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
 
-        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalRunArgs, $finalCommand);
+        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
         $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
         generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
@@ -1494,11 +1532,7 @@ while (true) {
         $reproducerCrash = false;
         if (is_file($reproducerScript)) {
             $stats['last_event'] = 'running reproducer';
-            $reproducerCommand = array_merge(
-                [$phpBin],
-                $phpIni !== null ? ['-c', $phpIni] : [],
-                [$reproducerScript]
-            );
+            $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
             $reproducerResult = run_command(
                 $reproducerCommand,
                 $phpBin,
@@ -1551,6 +1585,7 @@ while (true) {
         $finalCommand = $leakJob['command_string'];
         $finalOps = $currentOps;
         $dynamicArgs = $leakJob['dynamic_args'];
+        $finalPhpArgs = $leakJob['php_args'] ?? [];
 
         $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
@@ -1617,7 +1652,7 @@ while (true) {
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
 
-        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalRunArgs, $finalCommand);
+        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
         $movedCores = move_core_dumps($leakResult['core_files'], $jobDir);
         generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
@@ -1625,11 +1660,7 @@ while (true) {
         $reproducerLeak = false;
         if (is_file($reproducerScript)) {
             $stats['last_event'] = 'running leak reproducer';
-            $reproducerCommand = array_merge(
-                [$phpBin],
-                $phpIni !== null ? ['-c', $phpIni] : [],
-                [$reproducerScript]
-            );
+            $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
             $reproducerResult = run_command(
                 $reproducerCommand,
                 $phpBin,
