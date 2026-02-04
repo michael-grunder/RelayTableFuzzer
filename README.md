@@ -32,6 +32,12 @@ php /tmp/relay-fuzzer.php
 ./bin/harness --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
 ```
 
+To try reproducing a crash multiple times before classifying it, pass `--repro-tries`:
+
+```bash
+./bin/harness --php-bin ./php85d --repro-tries 5 --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
+```
+
 ```bash
 ./bin/harness --php-bin /usr/bin/php --php-ini ./relay.ini -- ./bin/fuzzer --ops 1000 --mode random
 ```

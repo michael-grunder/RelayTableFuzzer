@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 ### Added
+- Added `--repro-tries` to `bin/harness` to retry reproducer runs before classifying crashes or leaks.
 ### Changed
 ### Fixed
 ### Internal

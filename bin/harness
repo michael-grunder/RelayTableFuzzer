@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] [--repro-tries N] -- <command...>
 
 Dynamic replacements in command arguments and -d values:
   {range}            -> random integer
@@ -1275,6 +1275,7 @@ $timeoutSignalArg = null;
 $timeoutSignal = null;
 $jobs = 1;
 $renderInterval = 1.0;
+$reproTries = 1;
 $commandArgs = [];
 
 for ($i = 1; $i < $argc; $i++) {
@@ -1385,6 +1386,12 @@ for ($i = 1; $i < $argc; $i++) {
         continue;
     }
 
+    if ($arg === '--repro-tries') {
+        $reproTries = $argv[++$i] ?? null;
+        $reproTries = is_numeric($reproTries) ? (int)$reproTries : null;
+        continue;
+    }
+
     fwrite(STDERR, "Unknown option: {$arg}\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
@@ -1453,6 +1460,12 @@ if ($jobs === null || $jobs <= 0) {
 
 if ($renderInterval === null || $renderInterval <= 0) {
     fwrite(STDERR, "--interval requires a positive number\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($reproTries === null || $reproTries <= 0) {
+    fwrite(STDERR, "--repro-tries requires a positive integer\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
 }
@@ -1791,22 +1804,29 @@ while (true) {
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerCrash = false;
         if (is_file($reproducerScript)) {
-            $stats['last_event'] = 'running reproducer';
             $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
-            $reproducerResult = run_command(
-                $reproducerCommand,
-                $phpBin,
-                $maxSeconds,
-                $timeoutSignalArg,
-                $timeoutSignal,
-                $onlyCrashes
-            );
-            $reproducerCrash = $reproducerResult['is_crash'];
-            if (!empty($reproducerResult['core_files'])) {
-                $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
-                generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+            for ($attempt = 1; $attempt <= $reproTries; $attempt++) {
+                $stats['last_event'] = $reproTries > 1
+                    ? "running reproducer ({$attempt}/{$reproTries})"
+                    : 'running reproducer';
+                $reproducerResult = run_command(
+                    $reproducerCommand,
+                    $phpBin,
+                    $maxSeconds,
+                    $timeoutSignalArg,
+                    $timeoutSignal,
+                    $onlyCrashes
+                );
+                $reproducerCrash = $reproducerResult['is_crash'];
+                if (!empty($reproducerResult['core_files'])) {
+                    $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
+                    generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+                }
+                cleanup_output_files($reproducerResult);
+                if ($reproducerCrash) {
+                    break;
+                }
             }
-            cleanup_output_files($reproducerResult);
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
@@ -1947,25 +1967,32 @@ while (true) {
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerLeak = false;
         if (is_file($reproducerScript)) {
-            $stats['last_event'] = 'running leak reproducer';
             $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
-            $reproducerResult = run_command(
-                $reproducerCommand,
-                $phpBin,
-                $maxSeconds,
-                $timeoutSignalArg,
-                $timeoutSignal,
-                $onlyCrashes
-            );
-            $reproducerLeak = parse_php_leak_count(
-                $reproducerResult['stdout_path'],
-                $reproducerResult['stderr_path']
-            ) !== null;
-            if (!empty($reproducerResult['core_files'])) {
-                $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
-                generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+            for ($attempt = 1; $attempt <= $reproTries; $attempt++) {
+                $stats['last_event'] = $reproTries > 1
+                    ? "running leak reproducer ({$attempt}/{$reproTries})"
+                    : 'running leak reproducer';
+                $reproducerResult = run_command(
+                    $reproducerCommand,
+                    $phpBin,
+                    $maxSeconds,
+                    $timeoutSignalArg,
+                    $timeoutSignal,
+                    $onlyCrashes
+                );
+                $reproducerLeak = parse_php_leak_count(
+                    $reproducerResult['stdout_path'],
+                    $reproducerResult['stderr_path']
+                ) !== null;
+                if (!empty($reproducerResult['core_files'])) {
+                    $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
+                    generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+                }
+                cleanup_output_files($reproducerResult);
+                if ($reproducerLeak) {
+                    break;
+                }
             }
-            cleanup_output_files($reproducerResult);
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $leaksDir, $reproducerLeak);
