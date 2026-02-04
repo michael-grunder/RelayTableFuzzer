@@ -13,6 +13,9 @@ final class ScriptGenerator
     ) {
     }
 
+    /**
+     * @param list<string> $contextLines
+     */
     public function generate(Options $options, array $contextLines = []): string
     {
         $lines = [];
@@ -58,6 +61,9 @@ final class ScriptGenerator
         return implode("\n", $lines) . "\n";
     }
 
+    /**
+     * @param list<string> $lines
+     */
     private function appendQueueCommands(array &$lines, Options $options): void
     {
         $lines[] = '// queue mode command stream';
@@ -74,6 +80,9 @@ final class ScriptGenerator
         }
     }
 
+    /**
+     * @param list<string> $lines
+     */
     private function appendRandomCommands(array &$lines, Options $options): void
     {
         $workers = $options->workers > 0 ? $options->workers : 1;
@@ -127,6 +136,9 @@ final class ScriptGenerator
         $lines[] = '}';
     }
 
+    /**
+     * @return array<int, list<string>>
+     */
     private function buildRandomCommandSequences(Options $options, int $workers): array
     {
         $sequences = [];
@@ -149,6 +161,9 @@ final class ScriptGenerator
         return $sequences;
     }
 
+    /**
+     * @param array<string, mixed> $cmd
+     */
     private function commandToPhp(array $cmd): string
     {
         $op = $cmd['op'] ?? '';

@@ -211,6 +211,9 @@ final class FuzzerRunner
         ));
     }
 
+    /**
+     * @param array<string, mixed> $cmd
+     */
     private function executeCommand(array $cmd, Logger $logger, int $workerId): void
     {
         $op = $cmd['op'] ?? '';
@@ -291,6 +294,9 @@ final class FuzzerRunner
         return sprintf(' mem %d/%d', (int) $memory['used'], (int) $memory['total']);
     }
 
+    /**
+     * @return array{string, int}
+     */
     private function parseHostPort(string $spec): array
     {
         $parts = explode(':', $spec, 2);

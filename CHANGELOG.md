@@ -9,5 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added `--repro-tries` to `bin/harness` to retry reproducer runs before classifying crashes or leaks.
 ### Changed
+- `run-reproducer.sh` now uses absolute paths and copies the active php.ini into the reproducer directory.
 ### Fixed
 ### Internal

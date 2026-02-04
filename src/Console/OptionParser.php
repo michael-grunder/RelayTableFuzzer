@@ -12,6 +12,9 @@ final class OptionParser
         'get', 'set', 'exists', 'delete', 'ttl', 'count', 'clear', 'namespaces', 'clearAll',
     ];
 
+    /**
+     * @param array<string, string|int|float|bool|null> $options
+     */
     public static function parse(array $options, string $invocation): Options
     {
         $workers = isset($options['workers']) ? (int) $options['workers'] : 0;
@@ -92,6 +95,9 @@ final class OptionParser
         );
     }
 
+    /**
+     * @return list<string>
+     */
     private static function parseCsl(string $value): array
     {
         if ($value === '') {

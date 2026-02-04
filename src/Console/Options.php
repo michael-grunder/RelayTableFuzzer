@@ -6,6 +6,11 @@ namespace Mgrunder\RelayTableFuzzer\Console;
 
 final class Options
 {
+    /**
+     * @param list<string> $include
+     * @param list<string> $exclude
+     * @param list<string> $opSet
+     */
     public function __construct(
         public readonly int $workers,
         public readonly int $ops,

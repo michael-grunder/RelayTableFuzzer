@@ -3,6 +3,8 @@ parameters:
   paths:
     - bin
     - src
+  stubFiles:
+    - stubs/relay-table.stub.php
 
 # Optionally pin analysis assumptions:
 # phpVersion: 80400   # PHP 8.4

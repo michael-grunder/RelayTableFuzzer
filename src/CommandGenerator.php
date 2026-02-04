@@ -6,6 +6,10 @@ namespace Mgrunder\RelayTableFuzzer;
 
 final class CommandGenerator
 {
+    /**
+     * @param list<string> $ops
+     * @return array<string, mixed>
+     */
     public function generate(array $ops, int $keys, int $namespaces, int $maxKeySize, int $maxMems): array
     {
         $op = $ops[mt_rand(0, count($ops) - 1)];
