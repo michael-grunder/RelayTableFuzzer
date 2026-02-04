@@ -25,7 +25,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] -- <command...>
 
 Dynamic replacements in command arguments and -d values:
   {range}            -> random integer
@@ -93,6 +93,44 @@ function build_php_command(string $phpBin, ?string $phpIni, array $phpArgs, arra
 {
     $iniArgs = ($phpIni !== null && $phpIni !== '') ? ['-c', $phpIni] : [];
     return array_merge([$phpBin], $iniArgs, $phpArgs, $runArgs);
+}
+
+function create_temp_dir(string $prefix): string
+{
+    $tmp = tempnam(sys_get_temp_dir(), $prefix);
+    if ($tmp === false) {
+        fwrite(STDERR, "Failed to create temp path\n");
+        exit(1);
+    }
+    @unlink($tmp);
+    if (!mkdir($tmp, 0777, true) && !is_dir($tmp)) {
+        fwrite(STDERR, "Failed to create temp dir: {$tmp}\n");
+        exit(1);
+    }
+    return $tmp;
+}
+
+function remove_dir_recursive(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+    $entries = scandir($dir);
+    if ($entries === false) {
+        return;
+    }
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $path = $dir . '/' . $entry;
+        if (is_dir($path)) {
+            remove_dir_recursive($path);
+            continue;
+        }
+        @unlink($path);
+    }
+    @rmdir($dir);
 }
 
 function format_duration(int $seconds): string
@@ -689,6 +727,26 @@ function should_generate_script(array $runArgs): bool
     return $binary === 'fuzzer' || $binary === 'fuzzer.php';
 }
 
+function capture_script_artifacts(string $sourceDir, string $destinationDir): void
+{
+    $files = [
+        'reproducer.php',
+        'reproducer-generate.stderr',
+        'run-reproducer.sh',
+    ];
+    foreach ($files as $file) {
+        $source = $sourceDir . '/' . $file;
+        if (!is_file($source)) {
+            continue;
+        }
+        $dest = $destinationDir . '/' . $file;
+        if (file_exists($dest)) {
+            @unlink($dest);
+        }
+        @copy($source, $dest);
+    }
+}
+
 function generate_reproducer_script(
     string $jobDir,
     string $phpBin,
@@ -768,6 +826,53 @@ function generate_reproducer_script(
     }
 }
 
+function create_script_job(
+    array $commandArgs,
+    ?int $currentOps,
+    string $phpBin,
+    ?string $phpIni,
+    array $phpArgs,
+    int $jobId,
+    ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal
+): array {
+    $dynamicArgs = array_map('replace_dynamic', $commandArgs);
+    $dynamicPhpArgs = array_map('replace_dynamic', $phpArgs);
+    $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
+
+    $generatorCommand = build_php_command($phpBin, $phpIni, $dynamicPhpArgs, $runArgs);
+    $generatorCommandString = render_command($generatorCommand);
+
+    $scriptDir = create_temp_dir('relay-harness-script-');
+    generate_reproducer_script($scriptDir, $phpBin, $phpIni, $dynamicPhpArgs, $runArgs, $generatorCommandString);
+
+    $scriptPath = $scriptDir . '/reproducer.php';
+    if (!is_file($scriptPath)) {
+        $stderrPath = $scriptDir . '/reproducer-generate.stderr';
+        $message = '';
+        if (is_file($stderrPath)) {
+            $message = trim((string)file_get_contents($stderrPath));
+        }
+        fwrite(STDERR, "Script generation failed. {$message}\n");
+        exit(1);
+    }
+
+    $scriptCommand = build_php_command($phpBin, $phpIni, $dynamicPhpArgs, [$scriptPath]);
+    $job = start_command($scriptCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal);
+    $job['id'] = $jobId;
+    $job['dynamic_args'] = $dynamicArgs;
+    $job['php_args'] = $dynamicPhpArgs;
+    $job['full_command'] = $scriptCommand;
+    $job['command_string'] = render_command(wrap_timeout_command($scriptCommand, $maxSeconds, $timeoutSignalArg));
+    $job['ops'] = $currentOps;
+    $job['script_dir'] = $scriptDir;
+    $job['script_path'] = $scriptPath;
+    $job['generator_command'] = $generatorCommandString;
+
+    return $job;
+}
+
 function reduce_ops(
     int $maxOps,
     array $dynamicArgs,
@@ -804,6 +909,67 @@ function reduce_ops(
             generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
         }
         cleanup_output_files($result);
+        maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
+        if ($result['is_crash']) {
+            $high = $mid;
+            continue;
+        }
+
+        $low = $mid + 1;
+    }
+
+    return $low;
+}
+
+function reduce_ops_script(
+    int $maxOps,
+    array $dynamicArgs,
+    string $phpBin,
+    ?string $phpIni,
+    array $phpArgs,
+    array &$stats,
+    string $jobDir,
+    ?int $maxSeconds,
+    ?string $timeoutSignalArg,
+    ?int $timeoutSignal,
+    bool $onlyCrashes,
+    float $renderInterval,
+    float &$lastRenderTime
+): int {
+    $low = 1;
+    $high = $maxOps;
+
+    while ($low < $high) {
+        $mid = intdiv($low + $high, 2);
+        $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $mid), $dynamicArgs);
+        $generatorCommand = build_php_command($phpBin, $phpIni, $phpArgs, $runArgs);
+        $generatorCommandString = render_command($generatorCommand);
+
+        $scriptDir = create_temp_dir('relay-harness-reduce-');
+        generate_reproducer_script($scriptDir, $phpBin, $phpIni, $phpArgs, $runArgs, $generatorCommandString);
+        $scriptPath = $scriptDir . '/reproducer.php';
+        if (!is_file($scriptPath)) {
+            remove_dir_recursive($scriptDir);
+            fwrite(STDERR, "Script generation failed during reduction\n");
+            exit(1);
+        }
+
+        $scriptCommand = build_php_command($phpBin, $phpIni, $phpArgs, [$scriptPath]);
+        $commandString = render_command(wrap_timeout_command($scriptCommand, $maxSeconds, $timeoutSignalArg));
+
+        $result = run_command($scriptCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $onlyCrashes);
+        $stats['runs']++;
+        $stats['last_command'] = $commandString;
+        $stats['last_event'] = "reducing ops: {$mid}";
+        if ($result['is_crash']) {
+            $stats['last_failure_time'] = microtime(true);
+            $stats['last_failure_summary'] = build_failure_summary($result);
+            $stats['last_event'] = "reducer crash at ops {$mid}";
+            $movedCores = move_core_dumps($result['core_files'], $jobDir);
+            generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
+        }
+        cleanup_output_files($result);
+        remove_dir_recursive($scriptDir);
         maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
         if ($result['is_crash']) {
             $high = $mid;
@@ -1101,6 +1267,7 @@ $phpIni = null;
 $phpArgs = [];
 $ops = null;
 $reduce = false;
+$harnessMode = 'fuzz';
 $onlyCrashes = false;
 $capturePhpLeaks = false;
 $maxSeconds = null;
@@ -1164,6 +1331,16 @@ for ($i = 1; $i < $argc; $i++) {
 
     if ($arg === '--reduce') {
         $reduce = true;
+        continue;
+    }
+
+    if ($arg === '--mode') {
+        $harnessMode = strtolower((string) ($argv[++$i] ?? ''));
+        continue;
+    }
+
+    if (str_starts_with($arg, '--mode=')) {
+        $harnessMode = strtolower(substr($arg, strlen('--mode=')));
         continue;
     }
 
@@ -1280,6 +1457,22 @@ if ($renderInterval === null || $renderInterval <= 0) {
     exit(1);
 }
 
+$harnessMode = strtolower(trim($harnessMode));
+if ($harnessMode === '') {
+    $harnessMode = 'fuzz';
+}
+if (!in_array($harnessMode, ['fuzz', 'script'], true)) {
+    fwrite(STDERR, "Invalid --mode: {$harnessMode} (use fuzz or script)\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+if ($harnessMode === 'script' && !should_generate_script($commandArgs)) {
+    fwrite(STDERR, "--mode=script requires the command after -- to be bin/fuzzer\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 ensure_core_ulimit_unlimited();
 
 $reproducersDir = __DIR__ . '/../reproducers';
@@ -1323,17 +1516,31 @@ while (true) {
 
     while (!$stopAfterCrash && !$stopAfterLeak && count($runningJobs) < $jobs) {
         $jobCounter++;
-        $job = create_job(
-            $commandArgs,
-            $currentOps,
-            $phpBin,
-            $phpIni,
-            $phpArgs,
-            $jobCounter,
-            $maxSeconds,
-            $timeoutSignalArg,
-            $timeoutSignal
-        );
+        if ($harnessMode === 'script') {
+            $job = create_script_job(
+                $commandArgs,
+                $currentOps,
+                $phpBin,
+                $phpIni,
+                $phpArgs,
+                $jobCounter,
+                $maxSeconds,
+                $timeoutSignalArg,
+                $timeoutSignal
+            );
+        } else {
+            $job = create_job(
+                $commandArgs,
+                $currentOps,
+                $phpBin,
+                $phpIni,
+                $phpArgs,
+                $jobCounter,
+                $maxSeconds,
+                $timeoutSignalArg,
+                $timeoutSignal
+            );
+        }
         $runningJobs[$job['id']] = $job;
         $stats['last_command'] = $job['command_string'];
         $stats['last_event'] = "spawned job {$job['id']}";
@@ -1356,6 +1563,9 @@ while (true) {
 
         if ($job['cancelled']) {
             cleanup_output_files($result);
+            if ($harnessMode === 'script' && isset($job['script_dir'])) {
+                remove_dir_recursive((string) $job['script_dir']);
+            }
             continue;
         }
 
@@ -1401,13 +1611,16 @@ while (true) {
             }
         } else {
             cleanup_output_files($result);
+            if ($harnessMode === 'script' && isset($job['script_dir'])) {
+                remove_dir_recursive((string) $job['script_dir']);
+            }
         }
 
         $stats['active_jobs'] = count($runningJobs);
         maybe_render_screen(
             $stats,
             $currentOps,
-            $stopAfterCrash ? 'reducing' : 'fuzzing',
+            $stopAfterCrash ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
             $renderInterval,
             $lastRenderTime,
             $result['is_crash'] || $leakCount !== null
@@ -1418,7 +1631,7 @@ while (true) {
     maybe_render_screen(
         $stats,
         $currentOps,
-        $stopAfterCrash ? 'reducing' : 'fuzzing',
+        $stopAfterCrash ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
         $renderInterval,
         $lastRenderTime
     );
@@ -1430,44 +1643,90 @@ while (true) {
 
         $finalCommand = $crashJob['command_string'];
         $finalOps = $currentOps;
+        $originalOps = $currentOps;
         $dynamicArgs = $crashJob['dynamic_args'];
         $finalPhpArgs = $crashJob['php_args'] ?? [];
+        $finalGeneratorCommand = $crashJob['generator_command'] ?? null;
 
         if ($reduce && $currentOps !== null) {
             $stats['reductions']++;
             $stats['active_jobs'] = 1;
-            $finalOps = reduce_ops(
-                $currentOps,
-                $dynamicArgs,
-                $phpBin,
-                $phpIni,
-                $finalPhpArgs,
-                $stats,
-                $jobDir,
-                $maxSeconds,
-                $timeoutSignalArg,
-                $timeoutSignal,
-                $onlyCrashes,
-                $renderInterval,
-                $lastRenderTime
-            );
-            $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
-            $finalCommand = render_command(wrap_timeout_command(
-                build_php_command($phpBin, $phpIni, $finalPhpArgs, $reducedArgs),
-                $maxSeconds,
-                $timeoutSignalArg
-            ));
+            if ($harnessMode === 'script') {
+                $finalOps = reduce_ops_script(
+                    $currentOps,
+                    $dynamicArgs,
+                    $phpBin,
+                    $phpIni,
+                    $finalPhpArgs,
+                    $stats,
+                    $jobDir,
+                    $maxSeconds,
+                    $timeoutSignalArg,
+                    $timeoutSignal,
+                    $onlyCrashes,
+                    $renderInterval,
+                    $lastRenderTime
+                );
+            } else {
+                $finalOps = reduce_ops(
+                    $currentOps,
+                    $dynamicArgs,
+                    $phpBin,
+                    $phpIni,
+                    $finalPhpArgs,
+                    $stats,
+                    $jobDir,
+                    $maxSeconds,
+                    $timeoutSignalArg,
+                    $timeoutSignal,
+                    $onlyCrashes,
+                    $renderInterval,
+                    $lastRenderTime
+                );
+                $reducedArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
+                $finalCommand = render_command(wrap_timeout_command(
+                    build_php_command($phpBin, $phpIni, $finalPhpArgs, $reducedArgs),
+                    $maxSeconds,
+                    $timeoutSignalArg
+                ));
 
-            if ($finalCommand !== $crashJob['command_string']) {
-                file_put_contents($jobDir . '/command-original.txt', $crashJob['command_string'] . "\n");
+                if ($finalCommand !== $crashJob['command_string']) {
+                    file_put_contents($jobDir . '/command-original.txt', $crashJob['command_string'] . "\n");
+                }
             }
         }
 
         $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
-        file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+        if ($harnessMode === 'script') {
+            $finalGeneratorCommand = render_command(build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs));
+        }
 
         $outputFiles = move_output_files($crashResult, $jobDir);
         cleanup_output_files($crashResult);
+
+        if ($harnessMode === 'script') {
+            $shouldRegenerate = $reduce && $finalOps !== null && $finalOps !== $originalOps;
+            if (!$shouldRegenerate && isset($crashJob['script_dir'])) {
+                capture_script_artifacts((string) $crashJob['script_dir'], $jobDir);
+            } else {
+                generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalGeneratorCommand ?? $finalCommand);
+            }
+            $finalCommand = render_command(wrap_timeout_command(
+                build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
+                $maxSeconds,
+                $timeoutSignalArg
+            ));
+            file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+            if ($finalGeneratorCommand !== null) {
+                file_put_contents($jobDir . '/generator-command.txt', $finalGeneratorCommand . "\n");
+                if ($reduce && $finalOps !== null && $finalOps !== $originalOps && isset($crashJob['generator_command'])) {
+                    file_put_contents($jobDir . '/generator-command-original.txt', $crashJob['generator_command'] . "\n");
+                }
+            }
+        } else {
+            file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+            generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
+        }
 
         $signal = $crashResult['signal'];
         $exitCode = $crashResult['exit_code'];
@@ -1507,6 +1766,9 @@ while (true) {
         if ($outputFiles !== []) {
             $reportData['output_files'] = $outputFiles;
         }
+        if ($harnessMode === 'script' && $finalGeneratorCommand !== null) {
+            $reportData['generator_command'] = $finalGeneratorCommand;
+        }
 
         $report = [];
         foreach ($reportData as $key => $value) {
@@ -1523,8 +1785,6 @@ while (true) {
             $jobDir . '/report.json',
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
-
-        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
         $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
         generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
@@ -1550,6 +1810,9 @@ while (true) {
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
+        if ($harnessMode === 'script' && isset($crashJob['script_dir'])) {
+            remove_dir_recursive((string) $crashJob['script_dir']);
+        }
 
         $stats['reproducers']++;
         if ($reproducerCrash) {
@@ -1561,7 +1824,7 @@ while (true) {
         maybe_render_screen(
             $stats,
             $currentOps,
-            $reduce ? 'reducing' : 'fuzzing',
+            $reduce ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
             $renderInterval,
             $lastRenderTime,
             true
@@ -1586,12 +1849,36 @@ while (true) {
         $finalOps = $currentOps;
         $dynamicArgs = $leakJob['dynamic_args'];
         $finalPhpArgs = $leakJob['php_args'] ?? [];
+        $finalGeneratorCommand = $leakJob['generator_command'] ?? null;
 
         $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
-        file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+        if ($harnessMode === 'script') {
+            $finalGeneratorCommand = render_command(build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs));
+        } else {
+            file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+        }
 
         $outputFiles = move_output_files($leakResult, $jobDir);
         cleanup_output_files($leakResult);
+
+        if ($harnessMode === 'script') {
+            if (isset($leakJob['script_dir'])) {
+                capture_script_artifacts((string) $leakJob['script_dir'], $jobDir);
+            } else {
+                generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalGeneratorCommand ?? $finalCommand);
+            }
+            $finalCommand = render_command(wrap_timeout_command(
+                build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
+                $maxSeconds,
+                $timeoutSignalArg
+            ));
+            file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
+            if ($finalGeneratorCommand !== null) {
+                file_put_contents($jobDir . '/generator-command.txt', $finalGeneratorCommand . "\n");
+            }
+        } else {
+            generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
+        }
 
         $signal = $leakResult['signal'];
         $exitCode = $leakResult['exit_code'];
@@ -1635,6 +1922,9 @@ while (true) {
         if ($outputFiles !== []) {
             $reportData['output_files'] = $outputFiles;
         }
+        if ($harnessMode === 'script' && $finalGeneratorCommand !== null) {
+            $reportData['generator_command'] = $finalGeneratorCommand;
+        }
 
         $report = [];
         foreach ($reportData as $key => $value) {
@@ -1651,8 +1941,6 @@ while (true) {
             $jobDir . '/report.json',
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
-
-        generate_reproducer_script($jobDir, $phpBin, $phpIni, $finalPhpArgs, $finalRunArgs, $finalCommand);
         $movedCores = move_core_dumps($leakResult['core_files'], $jobDir);
         generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
 
@@ -1681,6 +1969,9 @@ while (true) {
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $leaksDir, $reproducerLeak);
+        if ($harnessMode === 'script' && isset($leakJob['script_dir'])) {
+            remove_dir_recursive((string) $leakJob['script_dir']);
+        }
 
         $stats['last_event'] = "leak saved: {$finalJobDir}";
         $stats['last_reproducer'] = $finalJobDir;
@@ -1688,7 +1979,7 @@ while (true) {
         maybe_render_screen(
             $stats,
             $currentOps,
-            $reduce ? 'reducing' : 'fuzzing',
+            $reduce ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
             $renderInterval,
             $lastRenderTime,
             true

@@ -77,9 +77,62 @@ final class ScriptGenerator
     private function appendRandomCommands(array &$lines, Options $options): void
     {
         $workers = $options->workers > 0 ? $options->workers : 1;
+        $sequences = $this->buildRandomCommandSequences($options, $workers);
+
+        if ($options->workers <= 0) {
+            $lines[] = '// worker 0 sequence';
+            foreach ($sequences[0] as $command) {
+                $lines[] = $command;
+            }
+            return;
+        }
+
+        $lines[] = 'function work(int $workerId): void';
+        $lines[] = '{';
+        $lines[] = '    switch ($workerId) {';
+        foreach ($sequences as $workerId => $commands) {
+            $lines[] = sprintf('        case %d:', $workerId);
+            $lines[] = sprintf('            // worker %d sequence', $workerId);
+            foreach ($commands as $command) {
+                $lines[] = '            ' . $command;
+            }
+            $lines[] = '            break;';
+        }
+        $lines[] = '        default:';
+        $lines[] = '            return;';
+        $lines[] = '    }';
+        $lines[] = '}';
+        $lines[] = '';
+        $lines[] = 'if (!function_exists(\'pcntl_fork\')) {';
+        $lines[] = '    fwrite(STDERR, "pcntl extension is required for workers > 0.\n");';
+        $lines[] = '    exit(1);';
+        $lines[] = '}';
+        $lines[] = '';
+        $lines[] = '$pids = [];';
+        $lines[] = sprintf('for ($i = 0; $i < %d; $i++) {', $options->workers);
+        $lines[] = '    $pid = pcntl_fork();';
+        $lines[] = '    if ($pid === -1) {';
+        $lines[] = '        fwrite(STDERR, "Failed to fork worker {$i}.\n");';
+        $lines[] = '        exit(1);';
+        $lines[] = '    }';
+        $lines[] = '    if ($pid === 0) {';
+        $lines[] = '        work($i);';
+        $lines[] = '        exit(0);';
+        $lines[] = '    }';
+        $lines[] = '    $pids[] = $pid;';
+        $lines[] = '}';
+        $lines[] = '';
+        $lines[] = 'foreach ($pids as $pid) {';
+        $lines[] = '    pcntl_waitpid($pid, $status);';
+        $lines[] = '}';
+    }
+
+    private function buildRandomCommandSequences(Options $options, int $workers): array
+    {
+        $sequences = [];
         for ($workerId = 0; $workerId < $workers; $workerId++) {
-            $lines[] = sprintf('// worker %d sequence', $workerId);
             mt_srand($options->seed + $workerId);
+            $commands = [];
             for ($i = 0; $i < $options->ops; $i++) {
                 $cmd = $this->generator->generate(
                     $options->opSet,
@@ -88,10 +141,12 @@ final class ScriptGenerator
                     $options->maxKeySize,
                     $options->maxMems
                 );
-                $lines[] = $this->commandToPhp($cmd);
+                $commands[] = $this->commandToPhp($cmd);
             }
-            $lines[] = '';
+            $sequences[$workerId] = $commands;
         }
+
+        return $sequences;
     }
 
     private function commandToPhp(array $cmd): string
