@@ -47,3 +47,33 @@ To try reproducing a crash multiple times before classifying it, pass `--repro-t
 ```bash
 ./bin/harness --php-bin /usr/bin/php --php-ini ./relay.ini -- ./bin/fuzzer --ops 1000 --mode random
 ```
+
+## Complex example of running the harness
+
+Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under
+valgrind, capturing reproducers when valgrind reports errors. For each reproducer
+the fuzzer will try to reduce it to the smallest possible program that still has
+a memory error.
+
+**Note**: Valgrind is optional. Without valgrind we will just detect if the process exits with a crashing signal.
+
+```bash
+./bin/harness \
+    --php-bin /path/to/php \
+    --capture-php-leaks \
+    --valgrind \
+    --mode script \
+    --repro-tries 10 \
+    --jobs 36 \
+    --reduce \
+    --ops 50 \
+    --timeout 10 \
+    -drelay.maxmemory='{range(200000,256000)}' \
+    -- \
+        ./bin/fuzzer \
+            --workers 2 \
+            --ops '{ops}' \
+            --seed '{range}' \
+            --keys '{range(1,1000)}' \
+            --namespaces '{range(1,20)}'
+```

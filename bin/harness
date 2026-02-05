@@ -106,6 +106,7 @@ function build_valgrind_command(string $valgrindBin, string $logPath, array $com
         [
             $valgrindBin,
             '--error-exitcode=' . VALGRIND_ERROR_EXIT_CODE,
+            '--track-origins=yes',
             '--log-file=' . $logPath,
             '--',
         ],
