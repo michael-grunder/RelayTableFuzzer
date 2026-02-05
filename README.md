@@ -32,6 +32,12 @@ php /tmp/relay-fuzzer.php
 ./bin/harness --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
 ```
 
+To run the script-mode harness under valgrind, add `--mode=script --valgrind`:
+
+```bash
+./bin/harness --mode=script --valgrind --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
+```
+
 To try reproducing a crash multiple times before classifying it, pass `--repro-tries`:
 
 ```bash
