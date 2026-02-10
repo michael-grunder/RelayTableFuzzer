@@ -1,0 +1,331 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+$args = $_SERVER['argv'] ?? [];
+$sortKey = 'lines';
+$reproducersDir = null;
+$oneLine = false;
+$statusFilter = null;
+
+foreach (array_slice($args, 1) as $arg) {
+    if ($arg === '-h' || $arg === '--help') {
+        fwrite(
+            STDOUT,
+            "Usage: reproducers [path] [--sort=lines|ops|mtime|name] [--oneline] [--reproducing|--non-reproducing]\n"
+        );
+        exit(0);
+    }
+    if ($arg === '--oneline') {
+        $oneLine = true;
+        continue;
+    }
+    if ($arg === '--reproducing') {
+        $statusFilter = 'reproducing';
+        continue;
+    }
+    if ($arg === '--non-reproducing') {
+        $statusFilter = 'non-reproducing';
+        continue;
+    }
+    if (str_starts_with($arg, '--sort=')) {
+        $sortKey = substr($arg, strlen('--sort='));
+        continue;
+    }
+    if ($reproducersDir === null) {
+        $reproducersDir = $arg;
+    }
+}
+
+if ($statusFilter !== null) {
+    $opposite = $statusFilter === 'reproducing' ? '--non-reproducing' : '--reproducing';
+    if (in_array($opposite, $args, true)) {
+        fwrite(STDERR, "cannot combine --reproducing and --non-reproducing\n");
+        exit(1);
+    }
+}
+
+$allowedSortKeys = ['lines', 'ops', 'mtime', 'name'];
+if (!in_array($sortKey, $allowedSortKeys, true)) {
+    fwrite(STDERR, "invalid sort key '{$sortKey}', expected one of: " . implode(', ', $allowedSortKeys) . "\n");
+    exit(1);
+}
+
+$reproducersDir ??= __DIR__ . '/../reproducers';
+$reproducersDir = rtrim($reproducersDir, '/');
+
+if (!is_dir($reproducersDir)) {
+    fwrite(STDERR, "reproducers directory not found: {$reproducersDir}\n");
+    exit(1);
+}
+
+$rows = collect_rows($reproducersDir, $statusFilter);
+if ($rows === []) {
+    fwrite(STDOUT, "no reproducers found in {$reproducersDir}\n");
+    exit(0);
+}
+
+usort($rows, static function (array $a, array $b) use ($sortKey): int {
+    if ($sortKey === 'mtime') {
+        $cmp = $a['mtime'] <=> $b['mtime'];
+        return $cmp !== 0 ? $cmp : strcmp($a['name'], $b['name']);
+    }
+    if ($sortKey === 'name') {
+        return strcmp($a['name'], $b['name']);
+    }
+    if ($sortKey === 'ops') {
+        $aOps = $a['ops'];
+        $bOps = $b['ops'];
+        if ($aOps === null && $bOps === null) {
+            return strcmp($a['name'], $b['name']);
+        }
+        if ($aOps === null) {
+            return 1;
+        }
+        if ($bOps === null) {
+            return -1;
+        }
+        $cmp = $aOps <=> $bOps;
+        return $cmp !== 0 ? $cmp : strcmp($a['name'], $b['name']);
+    }
+
+    $cmp = $a['line_count'] <=> $b['line_count'];
+    if ($cmp !== 0) {
+        return $cmp;
+    }
+
+    $aOps = $a['ops'];
+    $bOps = $b['ops'];
+    if ($aOps !== null && $bOps !== null) {
+        $cmp = $aOps <=> $bOps;
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+    }
+
+    return strcmp($a['name'], $b['name']);
+});
+
+$statusWidth = strlen('status');
+$linesWidth = strlen('lines');
+$opsWidth = 3;
+$exitWidth = 9;
+foreach ($rows as $row) {
+    $statusWidth = max($statusWidth, strlen($row['status']));
+    $linesWidth = max($linesWidth, strlen((string)$row['line_count']));
+    $opsLabel = $row['ops'] !== null ? (string)$row['ops'] : '-';
+    $opsWidth = max($opsWidth, strlen($opsLabel));
+    $exitWidth = max($exitWidth, strlen($row['exit_name']));
+}
+
+foreach ($rows as $row) {
+    $opsLabel = $row['ops'] !== null ? (string)$row['ops'] : '-';
+    $exitLabel = $row['exit_name'] !== '' ? $row['exit_name'] : '-';
+    $timeoutLabel = $row['timed_out'] ? 'yes' : 'no';
+    if ($oneLine) {
+        printf(
+            "%-{$statusWidth}s  %{$linesWidth}d  %{$opsWidth}s  %-{$exitWidth}s  %-3s  %s  %s\n",
+            $row['status'],
+            $row['line_count'],
+            $opsLabel,
+            $exitLabel,
+            $timeoutLabel,
+            $row['name'],
+            $row['dir']
+        );
+        continue;
+    }
+
+    printf(
+        "%-{$statusWidth}s  %{$linesWidth}d  %{$opsWidth}s  %-{$exitWidth}s  %-3s  %s\n",
+        $row['status'],
+        $row['line_count'],
+        $opsLabel,
+        $exitLabel,
+        $timeoutLabel,
+        $row['name']
+    );
+    if ($row['command'] !== '') {
+        fwrite(STDOUT, "  cmd: {$row['command']}\n");
+    }
+    if ($row['output_files'] !== []) {
+        $files = is_array($row['output_files']) ? implode(', ', $row['output_files']) : (string)$row['output_files'];
+        fwrite(STDOUT, "  outputs: {$files}\n");
+    }
+    if ($row['core_files'] !== []) {
+        $files = is_array($row['core_files']) ? implode(', ', $row['core_files']) : (string)$row['core_files'];
+        fwrite(STDOUT, "  cores: {$files}\n");
+    }
+    fwrite(STDOUT, "\n");
+}
+
+/**
+ * @return list<array{
+ *   name: string,
+ *   dir: string,
+ *   status: string,
+ *   mtime: int,
+ *   line_count: int,
+ *   ops: int|null,
+ *   exit_name: string,
+ *   timed_out: bool,
+ *   command: string,
+ *   core_files: array<int, mixed>|mixed,
+ *   output_files: array<int, mixed>|mixed
+ * }>
+ */
+function collect_rows(string $reproducersDir, ?string $statusFilter): array
+{
+    $rows = [];
+    $entries = scandir($reproducersDir);
+    if ($entries === false) {
+        fwrite(STDERR, "failed to scan: {$reproducersDir}\n");
+        exit(1);
+    }
+
+    $bucketDirs = [];
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $dir = $reproducersDir . '/' . $entry;
+        if (!is_dir($dir)) {
+            continue;
+        }
+
+        if ($entry === 'reproducing' || $entry === 'non-reproducing') {
+            $bucketDirs[$entry] = $dir;
+            continue;
+        }
+
+        if ($statusFilter !== null) {
+            continue;
+        }
+
+        $rows[] = build_row($entry, $dir, 'unknown');
+    }
+
+    foreach (['reproducing', 'non-reproducing'] as $bucket) {
+        if ($statusFilter !== null && $statusFilter !== $bucket) {
+            continue;
+        }
+        if (!isset($bucketDirs[$bucket])) {
+            continue;
+        }
+
+        $children = scandir($bucketDirs[$bucket]);
+        if ($children === false) {
+            continue;
+        }
+        foreach ($children as $child) {
+            if ($child === '.' || $child === '..') {
+                continue;
+            }
+            $dir = $bucketDirs[$bucket] . '/' . $child;
+            if (!is_dir($dir)) {
+                continue;
+            }
+            $rows[] = build_row($child, $dir, $bucket);
+        }
+    }
+
+    return $rows;
+}
+
+/**
+ * @return array{
+ *   name: string,
+ *   dir: string,
+ *   status: string,
+ *   mtime: int,
+ *   line_count: int,
+ *   ops: int|null,
+ *   exit_name: string,
+ *   timed_out: bool,
+ *   command: string,
+ *   core_files: array<int, mixed>|mixed,
+ *   output_files: array<int, mixed>|mixed
+ * }
+ */
+function build_row(string $name, string $dir, string $status): array
+{
+    $report = load_report($dir);
+
+    return [
+        'name' => $name,
+        'dir' => $dir,
+        'status' => $status,
+        'mtime' => filemtime($dir) ?: 0,
+        'line_count' => count_reproducer_lines($dir),
+        'ops' => $report['ops'] ?? null,
+        'exit_name' => $report['exit_name'] ?? '',
+        'timed_out' => !empty($report['timed_out']),
+        'command' => $report['command'] ?? '',
+        'core_files' => $report['core_files'] ?? [],
+        'output_files' => $report['output_files'] ?? [],
+    ];
+}
+
+function count_reproducer_lines(string $dir): int
+{
+    $path = $dir . '/reproducer.php';
+    if (!is_file($path)) {
+        return 0;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return 0;
+    }
+
+    return count($lines);
+}
+
+/** @return array<string, mixed> */
+function load_report(string $dir): array
+{
+    $jsonPath = $dir . '/report.json';
+    if (is_file($jsonPath)) {
+        $raw = file_get_contents($jsonPath);
+        if ($raw !== false) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+    }
+
+    $txtPath = $dir . '/report.txt';
+    if (!is_file($txtPath)) {
+        return [];
+    }
+
+    $report = [];
+    $lines = file($txtPath, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return [];
+    }
+    foreach ($lines as $line) {
+        $parts = explode(': ', $line, 2);
+        if (count($parts) !== 2) {
+            continue;
+        }
+        [$key, $value] = $parts;
+        if ($key === 'ops') {
+            $report[$key] = (int)$value;
+            continue;
+        }
+        if ($key === 'timed_out') {
+            $report[$key] = $value === 'yes';
+            continue;
+        }
+        if ($key === 'core_files' || $key === 'output_files') {
+            $report[$key] = $value === '' ? [] : array_map('trim', explode(',', $value));
+            continue;
+        }
+        $report[$key] = $value;
+    }
+
+    return $report;
+}

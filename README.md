@@ -48,6 +48,17 @@ To try reproducing a crash multiple times before classifying it, pass `--repro-t
 ./bin/harness --php-bin /usr/bin/php --php-ini ./relay.ini -- ./bin/fuzzer --ops 1000 --mode random
 ```
 
+## Reduce script-mode reproducers
+
+Reduce a script-mode reproducer by removing whole `Table::` statements (including
+multi-line calls) while preserving crashing behavior:
+
+```bash
+./bin/final-reduce-script --php-bin ./php85d --php-ini ./relay.ini --max-runs 10 \
+  -drelay.maxmemory=206715 \
+  reproducers/reproducing/20260210_230216_fd61f666/reproducer.php
+```
+
 ## Complex example of running the harness
 
 Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under
