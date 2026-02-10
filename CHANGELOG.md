@@ -12,5 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `run-reproducer.sh` now uses absolute paths and copies the active php.ini into the reproducer directory.
 - `run-reproducer.sh` now resolves the script directory at runtime for reproducer-local paths.
+- `bin/reprodcuers` now aggregates entries from `reproducing` and `non-reproducing`, supports `--reproducing` and `--non-reproducing` filters, and sorts by `reproducer.php` line count by default.
 ### Fixed
 ### Internal

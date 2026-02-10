@@ -77,3 +77,29 @@ a memory error.
             --keys '{range(1,1000)}' \
             --namespaces '{range(1,20)}'
 ```
+
+## List saved reproducers
+
+List all saved reproducers (aggregated from both `reproducing` and `non-reproducing`):
+
+```bash
+./bin/reproducers
+```
+
+Only show reproducing entries:
+
+```bash
+./bin/reproducers --reproducing
+```
+
+Only show non-reproducing entries in one-line form:
+
+```bash
+./bin/reproducers --non-reproducing --oneline
+```
+
+Sort by operation count instead of script line count:
+
+```bash
+./bin/reproducers --sort=ops
+```
