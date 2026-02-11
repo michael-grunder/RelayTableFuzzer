@@ -74,6 +74,14 @@ To only treat valgrind memory errors as crashes, use `--valgrind` (runs with
   reproducers/reproducing/.../reproducer.php
 ```
 
+Add `-v` for more reducer progress details, or `-vv` for per-attempt execution
+details (including command lines and stdout/stderr byte counts):
+
+```bash
+./bin/final-reduce-script -vv --php-bin ./php85d --max-runs 5 \
+  reproducers/reproducing/.../reproducer.php
+```
+
 ## Complex example of running the harness
 
 Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under

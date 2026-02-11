@@ -15,6 +15,7 @@ Options:
   --max-runs N         Number of attempts per candidate (default: 1)
   --timeout N          Kill runs that exceed N seconds
   --valgrind[=PATH]    Run under valgrind (default binary: valgrind)
+  -v, --verbose        Increase verbosity (repeat: -vv)
   --help               Show this help
 
 Notes:
@@ -34,6 +35,19 @@ function fail(string $message): never
     exit(1);
 }
 
+/**
+ * @param list<string> $argv
+ * @return array{
+ *   php_bin: string,
+ *   php_ini: ?string,
+ *   max_runs: int,
+ *   timeout_seconds: ?int,
+ *   valgrind_bin: ?string,
+ *   verbosity: int,
+ *   php_args: list<string>,
+ *   script_path: string
+ * }
+ */
 function parse_args(array $argv): array
 {
     $args = $argv;
@@ -44,6 +58,7 @@ function parse_args(array $argv): array
     $maxRuns = 1;
     $timeoutSeconds = null;
     $valgrindBin = null;
+    $verbosity = 0;
     $phpArgs = [];
     $scriptPath = null;
 
@@ -120,6 +135,19 @@ function parse_args(array $argv): array
             continue;
         }
 
+        if ($arg === '--verbose' || $arg === '-v') {
+            $verbosity = min($verbosity + 1, 2);
+            continue;
+        }
+        if ($arg === '-vv') {
+            $verbosity = 2;
+            continue;
+        }
+        if (str_starts_with($arg, '--verbose=')) {
+            $verbosity = parse_verbosity(substr($arg, strlen('--verbose=')));
+            continue;
+        }
+
         if (str_starts_with($arg, '--')) {
             fail("Unknown option: {$arg}");
         }
@@ -156,6 +184,7 @@ function parse_args(array $argv): array
         'max_runs' => $maxRuns,
         'timeout_seconds' => $timeoutSeconds,
         'valgrind_bin' => $valgrindBin,
+        'verbosity' => $verbosity,
         'php_args' => $phpArgs,
         'script_path' => $scriptPath,
     ];
@@ -187,6 +216,20 @@ function parse_timeout_seconds(string $raw): int
     }
 
     return $timeout;
+}
+
+function parse_verbosity(string $raw): int
+{
+    if ($raw === '' || preg_match('/^\d+$/', $raw) !== 1) {
+        fail("Invalid --verbose value: {$raw}");
+    }
+
+    $verbosity = (int) $raw;
+    if ($verbosity < 0 || $verbosity > 2) {
+        fail('--verbose must be between 0 and 2');
+    }
+
+    return $verbosity;
 }
 
 function resolve_executable_path(string $binary): string
@@ -267,6 +310,9 @@ function comment_out_line(string $line): string
     return $commented . $lineBreak;
 }
 
+/**
+ * @param list<string> $lines
+ */
 function find_statement_end(array $lines, int $start): int
 {
     $inSingle = false;
@@ -347,6 +393,10 @@ function find_statement_end(array $lines, int $start): int
     return $start;
 }
 
+/**
+ * @param list<string> $lines
+ * @return list<array{worker: int, start: int, end: int}>
+ */
 function collect_operations(array $lines): array
 {
     $operations = [];
@@ -384,6 +434,11 @@ function collect_operations(array $lines): array
     return $operations;
 }
 
+/**
+ * @param list<string> $lines
+ * @param list<array{worker: int, start: int, end: int}> $operations
+ * @param array<int, true> $activeOperationSet
+ */
 function build_script(array $lines, array $operations, array $activeOperationSet): string
 {
     $mutatedLines = $lines;
@@ -422,6 +477,10 @@ function write_temp_script(string $dir, string $contents): string
     return $tmpPhp;
 }
 
+/**
+ * @param list<string> $command
+ * @return list<string>
+ */
 function build_valgrind_command(string $valgrindBin, string $logPath, array $command): array
 {
     return [
@@ -436,6 +495,19 @@ function build_valgrind_command(string $valgrindBin, string $logPath, array $com
     ];
 }
 
+/**
+ * @param list<string> $phpArgs
+ * @return array{
+ *   command: string,
+ *   cwd: string,
+ *   exit_code: int,
+ *   signal: ?int,
+ *   timed_out: bool,
+ *   valgrind_errors: ?int,
+ *   stdout: string,
+ *   stderr: string
+ * }
+ */
 function run_php_once(
     string $phpBin,
     ?string $phpIni,
@@ -486,23 +558,20 @@ function run_php_once(
     $stderr = stream_get_contents($pipes[2]);
     fclose($pipes[2]);
 
+    /** @var array{command: string, pid: int, running: bool, signaled: bool, stopped: bool, exitcode: int, termsig: int, stopsig: int} $status */
     $status = proc_get_status($proc);
     $exitCode = proc_close($proc);
 
     $finalExit = null;
     $signal = null;
-    if (is_array($status)) {
-        if (!empty($status['signaled'])) {
-            $signal = $status['termsig'] ?? null;
-            if (is_int($signal)) {
-                $finalExit = 128 + $signal;
-            }
-        } elseif (isset($status['exitcode']) && is_int($status['exitcode']) && $status['exitcode'] !== -1) {
-            $finalExit = $status['exitcode'];
-        }
+    if ($status['signaled']) {
+        $signal = $status['termsig'];
+        $finalExit = 128 + $signal;
+    } elseif ($status['exitcode'] !== -1) {
+        $finalExit = $status['exitcode'];
     }
 
-    if ($finalExit === null && is_int($exitCode) && $exitCode !== -1) {
+    if ($finalExit === null && $exitCode !== -1) {
         $finalExit = $exitCode;
     }
     if ($finalExit === null) {
@@ -532,6 +601,18 @@ function is_crash(int $exitCode): bool
     return $exitCode >= 128;
 }
 
+/**
+ * @param array{
+ *   command: string,
+ *   cwd: string,
+ *   exit_code: int,
+ *   signal: ?int,
+ *   timed_out: bool,
+ *   valgrind_errors: ?int,
+ *   stdout: string,
+ *   stderr: string
+ * } $run
+ */
 function classify_crash(array $run, bool $usesValgrind): bool
 {
     if ($usesValgrind) {
@@ -542,6 +623,23 @@ function classify_crash(array $run, bool $usesValgrind): bool
     return is_crash((int) $run['exit_code']) || !empty($run['timed_out']);
 }
 
+/**
+ * @param list<string> $phpArgs
+ * @return array{
+ *   is_crash: bool,
+ *   attempts: int,
+ *   last_run: array{
+ *     command: string,
+ *     cwd: string,
+ *     exit_code: int,
+ *     signal: ?int,
+ *     timed_out: bool,
+ *     valgrind_errors: ?int,
+ *     stdout: string,
+ *     stderr: string
+ *   }|null
+ * }
+ */
 function run_php_with_retries(
     string $phpBin,
     ?string $phpIni,
@@ -551,7 +649,8 @@ function run_php_with_retries(
     int $maxRuns,
     ?int $timeoutSeconds,
     ?string $timeoutBin,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    int $verbosity
 ): array {
     $lastRun = null;
     $usesValgrind = $valgrindBin !== null;
@@ -567,6 +666,32 @@ function run_php_with_retries(
             $timeoutBin,
             $valgrindBin
         );
+
+        if ($verbosity >= 2) {
+            $details = [];
+            if (!empty($run['timed_out'])) {
+                $details[] = 'timeout';
+            }
+            $valgrindErrors = $run['valgrind_errors'] ?? null;
+            if (is_int($valgrindErrors)) {
+                $details[] = "valgrind_errors={$valgrindErrors}";
+            }
+
+            fwrite(
+                STDOUT,
+                sprintf(
+                    "  attempt %d/%d: exit %d%s%s\n",
+                    $attempt,
+                    $maxRuns,
+                    $run['exit_code'],
+                    $run['signal'] !== null ? sprintf(', signal %d', $run['signal']) : '',
+                    $details !== [] ? ' [' . implode(', ', $details) . ']' : ''
+                )
+            );
+            fwrite(STDOUT, sprintf("    stdout bytes: %d, stderr bytes: %d\n", strlen($run['stdout']), strlen($run['stderr'])));
+            fwrite(STDOUT, "    command: {$run['command']}\n");
+        }
+
         $lastRun = $run;
         if (classify_crash($run, $usesValgrind)) {
             return [
@@ -584,6 +709,11 @@ function run_php_with_retries(
     ];
 }
 
+/**
+ * @param list<int> $ops
+ * @param callable(list<int>): bool $test
+ * @return list<int>
+ */
 function ddmin(array $ops, callable $test): array
 {
     $n = 2;
@@ -631,6 +761,11 @@ function ddmin(array $ops, callable $test): array
     return $ops;
 }
 
+$argv = $_SERVER['argv'] ?? [];
+if (!is_array($argv)) {
+    $argv = [];
+}
+/** @var list<string> $argv */
 $config = parse_args($argv);
 
 $scriptPath = realpath($config['script_path']);
@@ -708,6 +843,7 @@ if ($config['php_args'] !== []) {
     );
 }
 fwrite(STDOUT, "Max runs per test: {$config['max_runs']}\n");
+fwrite(STDOUT, "Verbosity: {$config['verbosity']}\n");
 fwrite(STDOUT, "Worker operations: {$originalCount}\n");
 
 $workerSummaryParts = [];
@@ -743,7 +879,8 @@ $test = function (array $candidateOperationIds) use (
         $config['max_runs'],
         $config['timeout_seconds'],
         $timeoutBin,
-        $valgrindBin
+        $valgrindBin,
+        $config['verbosity']
     );
 
     @unlink($tmpScript);
@@ -780,7 +917,21 @@ $test = function (array $candidateOperationIds) use (
         )
     );
 
-    if ($testCount === 1) {
+    if ($config['verbosity'] >= 1) {
+        $workers = [];
+        foreach ($candidateOperationIds as $operationId) {
+            $worker = $operations[$operationId]['worker'];
+            $workers[$worker] = ($workers[$worker] ?? 0) + 1;
+        }
+        ksort($workers);
+        $workerParts = [];
+        foreach ($workers as $worker => $count) {
+            $workerParts[] = sprintf('%d=%d', $worker, $count);
+        }
+        fwrite(STDOUT, '  candidate workers: ' . implode(', ', $workerParts) . "\n");
+    }
+
+    if ($testCount === 1 || $config['verbosity'] >= 1) {
         fwrite(STDOUT, "Command: {$run['command']}\n");
         fwrite(STDOUT, "Cwd: {$run['cwd']}\n");
     }
@@ -806,10 +957,8 @@ if ($finalCount >= $originalCount) {
 $finalSet = array_fill_keys($reducedOperations, true);
 $finalContents = build_script($lines, $operations, $finalSet);
 
-$outputPath = preg_replace('/\.php$/', '', $scriptPath) . '.final-reduced-script.php';
-if ($outputPath === null) {
-    $outputPath = $scriptPath . '.final-reduced-script.php';
-}
+$scriptPathWithoutExtension = preg_replace('/\.php$/', '', $scriptPath);
+$outputPath = ($scriptPathWithoutExtension ?? $scriptPath) . '.final-reduced-script.php';
 
 if (file_put_contents($outputPath, $finalContents) === false) {
     fail("Failed to write reduced script: {$outputPath}");
