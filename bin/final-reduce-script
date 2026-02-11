@@ -12,7 +12,6 @@ Usage:
 Options:
   --php-bin PATH       Path to PHP binary (default: current PHP)
   --php-ini PATH       Path to php.ini (optional)
-  --php-inii PATH      Alias for --php-ini
   --max-runs N         Number of attempts per candidate (default: 1)
   --help               Show this help
 
@@ -67,10 +66,6 @@ function parse_args(array $argv): array
 
         if (str_starts_with($arg, '--php-ini=')) {
             $phpIni = substr($arg, strlen('--php-ini='));
-            continue;
-        }
-        if (str_starts_with($arg, '--php-inii=')) {
-            $phpIni = substr($arg, strlen('--php-inii='));
             continue;
         }
         if ($arg === '--php-ini' || $arg === '--php-inii') {
