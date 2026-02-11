@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `bin/final-reduce-script` to reduce script-mode reproducers by removing whole worker `Table::` statements, with forwarded PHP args and `--max-runs` retry support for nondeterministic crashes.
 - Added `--valgrind` and `--timeout` to `bin/final-reduce-script`; valgrind mode classifies crashes by valgrind memory errors only (leaks ignored), while timeout mode lets reducer treat infinite loops as reproducible failures.
 - Added `-v`/`-vv` verbosity controls to `bin/final-reduce-script` for richer runtime progress and retry diagnostics.
+- Added `--progress-mode=screen` and `--interval` to `bin/final-reduce-script` for a periodically refreshed live status screen showing elapsed time, iteration counter, and best-so-far script/command details.
 ### Changed
 - `run-reproducer.sh` now uses absolute paths and copies the active php.ini into the reproducer directory.
 - `run-reproducer.sh` now resolves the script directory at runtime for reproducer-local paths.

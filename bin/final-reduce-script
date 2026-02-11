@@ -15,6 +15,8 @@ Options:
   --max-runs N         Number of attempts per candidate (default: 1)
   --timeout N          Kill runs that exceed N seconds
   --valgrind[=PATH]    Run under valgrind (default binary: valgrind)
+  --progress-mode M    Progress output mode: plain|screen (default: plain)
+  --interval SECONDS   Screen refresh interval for --progress-mode=screen (default: 1.0)
   -v, --verbose        Increase verbosity (repeat: -vv)
   --help               Show this help
 
@@ -43,6 +45,8 @@ function fail(string $message): never
  *   max_runs: int,
  *   timeout_seconds: ?int,
  *   valgrind_bin: ?string,
+ *   progress_mode: 'plain'|'screen',
+ *   render_interval: float,
  *   verbosity: int,
  *   php_args: list<string>,
  *   script_path: string
@@ -58,6 +62,8 @@ function parse_args(array $argv): array
     $maxRuns = 1;
     $timeoutSeconds = null;
     $valgrindBin = null;
+    $progressMode = 'plain';
+    $renderInterval = 1.0;
     $verbosity = 0;
     $phpArgs = [];
     $scriptPath = null;
@@ -135,6 +141,32 @@ function parse_args(array $argv): array
             continue;
         }
 
+        if (str_starts_with($arg, '--progress-mode=')) {
+            $progressMode = parse_progress_mode(substr($arg, strlen('--progress-mode=')));
+            continue;
+        }
+        if ($arg === '--progress-mode') {
+            $i++;
+            if (!isset($args[$i])) {
+                fail('Missing value for --progress-mode');
+            }
+            $progressMode = parse_progress_mode($args[$i]);
+            continue;
+        }
+
+        if (str_starts_with($arg, '--interval=')) {
+            $renderInterval = parse_render_interval(substr($arg, strlen('--interval=')));
+            continue;
+        }
+        if ($arg === '--interval') {
+            $i++;
+            if (!isset($args[$i])) {
+                fail('Missing value for --interval');
+            }
+            $renderInterval = parse_render_interval($args[$i]);
+            continue;
+        }
+
         if ($arg === '--verbose' || $arg === '-v') {
             $verbosity = min($verbosity + 1, 2);
             continue;
@@ -184,6 +216,8 @@ function parse_args(array $argv): array
         'max_runs' => $maxRuns,
         'timeout_seconds' => $timeoutSeconds,
         'valgrind_bin' => $valgrindBin,
+        'progress_mode' => $progressMode,
+        'render_interval' => $renderInterval,
         'verbosity' => $verbosity,
         'php_args' => $phpArgs,
         'script_path' => $scriptPath,
@@ -230,6 +264,33 @@ function parse_verbosity(string $raw): int
     }
 
     return $verbosity;
+}
+
+/**
+ * @return 'plain'|'screen'
+ */
+function parse_progress_mode(string $raw): string
+{
+    $mode = strtolower(trim($raw));
+    if (!in_array($mode, ['plain', 'screen'], true)) {
+        fail("--progress-mode must be 'plain' or 'screen'");
+    }
+
+    return $mode;
+}
+
+function parse_render_interval(string $raw): float
+{
+    if ($raw === '' || !is_numeric($raw)) {
+        fail("Invalid --interval value: {$raw}");
+    }
+
+    $interval = (float) $raw;
+    if ($interval <= 0) {
+        fail('--interval must be > 0');
+    }
+
+    return $interval;
 }
 
 function resolve_executable_path(string $binary): string
@@ -308,6 +369,112 @@ function comment_out_line(string $line): string
     }
 
     return $commented . $lineBreak;
+}
+
+function terminal_width(): int
+{
+    $columns = getenv('COLUMNS');
+    if (is_string($columns) && ctype_digit($columns)) {
+        $width = (int) $columns;
+        if ($width >= 40 && $width <= 500) {
+            return $width;
+        }
+    }
+
+    return 120;
+}
+
+function format_duration(int $seconds): string
+{
+    $hours = intdiv($seconds, 3600);
+    $minutes = intdiv($seconds % 3600, 60);
+    $secs = $seconds % 60;
+
+    if ($hours > 0) {
+        return sprintf('%dh %02dm %02ds', $hours, $minutes, $secs);
+    }
+
+    return sprintf('%dm %02ds', $minutes, $secs);
+}
+
+function format_label_value(string $label, string $value): string
+{
+    return "{$label}: {$value}";
+}
+
+function render_progress_screen(array $progress): void
+{
+    $width = terminal_width();
+    $elapsed = format_duration((int) (microtime(true) - (float) $progress['start_time']));
+    $bestOps = (int) $progress['best_ops'];
+    $originalOps = (int) $progress['original_ops'];
+    $reduction = $originalOps - $bestOps;
+    $iteration = (int) $progress['test_count'];
+    $currentOps = $progress['current_candidate_ops'] !== null ? (int) $progress['current_candidate_ops'] : null;
+    $currentOpsText = $currentOps !== null ? (string) $currentOps : 'n/a';
+    $lastResult = (string) ($progress['last_result'] ?? 'n/a');
+    $lastExit = $progress['last_exit'] !== null ? (string) $progress['last_exit'] : 'n/a';
+    $lastSignal = $progress['last_signal'] !== null ? (string) $progress['last_signal'] : 'n/a';
+    $lastAttempts = (int) ($progress['last_attempts'] ?? 0);
+    $bestScriptPath = (string) $progress['best_script_path'];
+    $bestCommand = (string) $progress['best_command'];
+
+    $lines = [];
+    $lines[] = str_repeat('=', $width);
+    $lines[] = str_pad('relay-table-fuzzer final-reduce-script', $width, ' ', STR_PAD_BOTH);
+    $lines[] = str_repeat('-', $width);
+    $lines[] = format_label_value('Elapsed', $elapsed);
+    $lines[] = format_label_value('Iteration', "{$iteration}/?");
+    $lines[] = format_label_value('Current candidate ops', $currentOpsText);
+    $lines[] = format_label_value('Best ops', "{$bestOps}/{$originalOps} ({$reduction} fewer)");
+    $lines[] = format_label_value('Last result', "{$lastResult}, exit={$lastExit}, signal={$lastSignal}, attempts={$lastAttempts}");
+    $lines[] = str_repeat('-', $width);
+    $lines[] = format_label_value('Best script', $bestScriptPath);
+    $lines[] = format_label_value('Best command', $bestCommand);
+    $lines[] = str_repeat('=', $width);
+
+    fwrite(STDOUT, "\033[2J\033[H" . implode("\n", $lines) . "\n");
+    fflush(STDOUT);
+}
+
+function maybe_render_progress_screen(array $progress, float $interval, float &$lastRenderAt, bool $force = false): void
+{
+    $now = microtime(true);
+    if (!$force && ($now - $lastRenderAt) < $interval) {
+        return;
+    }
+
+    $lastRenderAt = $now;
+    render_progress_screen($progress);
+}
+
+/**
+ * @param list<string> $phpArgs
+ */
+function render_best_command(
+    string $phpBin,
+    ?string $phpIni,
+    array $phpArgs,
+    string $scriptPath,
+    ?int $timeoutSeconds,
+    ?string $timeoutBin,
+    ?string $valgrindBin
+): string {
+    $command = [$phpBin, ...$phpArgs];
+    if ($phpIni !== null && $phpIni !== '') {
+        $command[] = '-c';
+        $command[] = $phpIni;
+    }
+    $command[] = $scriptPath;
+
+    if ($valgrindBin !== null) {
+        $command = build_valgrind_command($valgrindBin, '/tmp/final-reduce-script-best.valgrind.log', $command);
+    }
+    if ($timeoutSeconds !== null && $timeoutBin !== null) {
+        $command = [$timeoutBin, (string) $timeoutSeconds, ...$command];
+    }
+
+    return implode(' ', array_map('escapeshellarg', $command));
 }
 
 /**
@@ -516,7 +683,8 @@ function run_php_once(
     string $cwd,
     ?int $timeoutSeconds,
     ?string $timeoutBin,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?callable $onTick
 ): array {
     $args = [$phpBin, ...$phpArgs];
     if ($phpIni !== null && $phpIni !== '') {
@@ -553,13 +721,46 @@ function run_php_once(
     }
 
     fclose($pipes[0]);
-    $stdout = stream_get_contents($pipes[1]);
-    fclose($pipes[1]);
-    $stderr = stream_get_contents($pipes[2]);
-    fclose($pipes[2]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
 
+    $stdout = '';
+    $stderr = '';
     /** @var array{command: string, pid: int, running: bool, signaled: bool, stopped: bool, exitcode: int, termsig: int, stopsig: int} $status */
     $status = proc_get_status($proc);
+    while ($status['running']) {
+        $read = [$pipes[1], $pipes[2]];
+        $write = null;
+        $except = null;
+        @stream_select($read, $write, $except, 0, 200000);
+
+        $outChunk = stream_get_contents($pipes[1]);
+        if (is_string($outChunk) && $outChunk !== '') {
+            $stdout .= $outChunk;
+        }
+        $errChunk = stream_get_contents($pipes[2]);
+        if (is_string($errChunk) && $errChunk !== '') {
+            $stderr .= $errChunk;
+        }
+
+        if ($onTick !== null) {
+            $onTick();
+        }
+
+        $status = proc_get_status($proc);
+    }
+
+    $outChunk = stream_get_contents($pipes[1]);
+    if (is_string($outChunk) && $outChunk !== '') {
+        $stdout .= $outChunk;
+    }
+    fclose($pipes[1]);
+    $errChunk = stream_get_contents($pipes[2]);
+    if (is_string($errChunk) && $errChunk !== '') {
+        $stderr .= $errChunk;
+    }
+    fclose($pipes[2]);
+
     $exitCode = proc_close($proc);
 
     $finalExit = null;
@@ -650,7 +851,9 @@ function run_php_with_retries(
     ?int $timeoutSeconds,
     ?string $timeoutBin,
     ?string $valgrindBin,
-    int $verbosity
+    int $verbosity,
+    bool $allowVerboseOutput,
+    ?callable $onTick
 ): array {
     $lastRun = null;
     $usesValgrind = $valgrindBin !== null;
@@ -664,10 +867,11 @@ function run_php_with_retries(
             $cwd,
             $timeoutSeconds,
             $timeoutBin,
-            $valgrindBin
+            $valgrindBin,
+            $onTick
         );
 
-        if ($verbosity >= 2) {
+        if ($allowVerboseOutput && $verbosity >= 2) {
             $details = [];
             if (!empty($run['timed_out'])) {
                 $details[] = 'timeout';
@@ -823,38 +1027,88 @@ ksort($workerCounts);
 $scriptDir = dirname($scriptPath);
 $activeOperations = array_keys($operations);
 $originalCount = count($activeOperations);
+$scriptPathWithoutExtension = preg_replace('/\.php$/', '', $scriptPath);
+$outputPath = ($scriptPathWithoutExtension ?? $scriptPath) . '.final-reduced-script.php';
+$bestScriptPath = ($scriptPathWithoutExtension ?? $scriptPath) . '.final-reduced-script.best.php';
+$screenMode = $config['progress_mode'] === 'screen';
+if (
+    $screenMode
+    && function_exists('stream_isatty')
+    && !stream_isatty(STDOUT)
+) {
+    fwrite(STDERR, "stdout is not a terminal; falling back to --progress-mode=plain\n");
+    $screenMode = false;
+}
+$lastRenderAt = 0.0;
 
-fwrite(STDOUT, "Final reduce (script mode) starting\n");
-fwrite(STDOUT, "Script: {$scriptPath}\n");
-fwrite(STDOUT, "PHP bin: {$phpBin}\n");
-if ($phpIni !== null && $phpIni !== '') {
-    fwrite(STDOUT, "PHP ini: {$phpIni}\n");
+$progress = [
+    'start_time' => microtime(true),
+    'test_count' => 0,
+    'original_ops' => $originalCount,
+    'current_candidate_ops' => null,
+    'best_ops' => $originalCount,
+    'best_script_path' => $bestScriptPath,
+    'best_command' => render_best_command(
+        $phpBin,
+        $phpIni,
+        $config['php_args'],
+        $bestScriptPath,
+        $config['timeout_seconds'],
+        $timeoutBin,
+        $valgrindBin
+    ),
+    'last_result' => 'n/a',
+    'last_exit' => null,
+    'last_signal' => null,
+    'last_attempts' => 0,
+];
+
+if (!$screenMode) {
+    fwrite(STDOUT, "Final reduce (script mode) starting\n");
+    fwrite(STDOUT, "Script: {$scriptPath}\n");
+    fwrite(STDOUT, "PHP bin: {$phpBin}\n");
+    if ($phpIni !== null && $phpIni !== '') {
+        fwrite(STDOUT, "PHP ini: {$phpIni}\n");
+    }
+    if (is_int($config['timeout_seconds']) && is_string($timeoutBin)) {
+        fwrite(STDOUT, "Timeout: {$config['timeout_seconds']}s ({$timeoutBin})\n");
+    }
+    if ($valgrindBin !== null) {
+        fwrite(STDOUT, "Valgrind: {$valgrindBin} (USE_ZEND_ALLOC=0)\n");
+    }
+    if ($config['php_args'] !== []) {
+        fwrite(
+            STDOUT,
+            'Forwarded PHP args: ' . implode(' ', array_map('escapeshellarg', $config['php_args'])) . "\n"
+        );
+    }
+    fwrite(STDOUT, "Max runs per test: {$config['max_runs']}\n");
+    fwrite(STDOUT, "Verbosity: {$config['verbosity']}\n");
+    fwrite(STDOUT, "Worker operations: {$originalCount}\n");
 }
-if (is_int($config['timeout_seconds']) && is_string($timeoutBin)) {
-    fwrite(STDOUT, "Timeout: {$config['timeout_seconds']}s ({$timeoutBin})\n");
-}
-if ($valgrindBin !== null) {
-    fwrite(STDOUT, "Valgrind: {$valgrindBin} (USE_ZEND_ALLOC=0)\n");
-}
-if ($config['php_args'] !== []) {
-    fwrite(
-        STDOUT,
-        'Forwarded PHP args: ' . implode(' ', array_map('escapeshellarg', $config['php_args'])) . "\n"
-    );
-}
-fwrite(STDOUT, "Max runs per test: {$config['max_runs']}\n");
-fwrite(STDOUT, "Verbosity: {$config['verbosity']}\n");
-fwrite(STDOUT, "Worker operations: {$originalCount}\n");
 
 $workerSummaryParts = [];
 foreach ($workerCounts as $worker => $count) {
     $workerSummaryParts[] = sprintf('worker %d=%d', $worker, $count);
 }
-fwrite(STDOUT, 'Workers: ' . implode(', ', $workerSummaryParts) . "\n");
+if (!$screenMode) {
+    fwrite(STDOUT, 'Workers: ' . implode(', ', $workerSummaryParts) . "\n");
+}
+
+$baselineContents = build_script($lines, $operations, array_fill_keys($activeOperations, true));
+if (file_put_contents($bestScriptPath, $baselineContents) === false) {
+    fail("Failed to write best script snapshot: {$bestScriptPath}");
+}
+
+if ($screenMode) {
+    maybe_render_progress_screen($progress, $config['render_interval'], $lastRenderAt, true);
+}
 
 $testCount = 0;
 $test = function (array $candidateOperationIds) use (
     &$testCount,
+    &$progress,
+    &$lastRenderAt,
     $lines,
     $operations,
     $phpBin,
@@ -862,9 +1116,16 @@ $test = function (array $candidateOperationIds) use (
     $config,
     $scriptDir,
     $timeoutBin,
-    $valgrindBin
+    $valgrindBin,
+    $screenMode,
+    $bestScriptPath
 ): bool {
     $testCount++;
+    $progress['test_count'] = $testCount;
+    $progress['current_candidate_ops'] = count($candidateOperationIds);
+    if ($screenMode) {
+        maybe_render_progress_screen($progress, $config['render_interval'], $lastRenderAt);
+    }
 
     $activeOperationSet = array_fill_keys($candidateOperationIds, true);
     $contents = build_script($lines, $operations, $activeOperationSet);
@@ -880,7 +1141,13 @@ $test = function (array $candidateOperationIds) use (
         $config['timeout_seconds'],
         $timeoutBin,
         $valgrindBin,
-        $config['verbosity']
+        $config['verbosity'],
+        !$screenMode,
+        $screenMode
+            ? static function () use (&$progress, $config, &$lastRenderAt): void {
+                maybe_render_progress_screen($progress, $config['render_interval'], $lastRenderAt);
+            }
+            : null
     );
 
     @unlink($tmpScript);
@@ -891,6 +1158,30 @@ $test = function (array $candidateOperationIds) use (
     }
 
     $crash = (bool) $runResult['is_crash'];
+    $candidateOps = count($candidateOperationIds);
+    $progress['last_result'] = $crash ? 'crash' : 'no crash';
+    $progress['last_exit'] = $run['exit_code'];
+    $progress['last_signal'] = $run['signal'];
+    $progress['last_attempts'] = $runResult['attempts'];
+    if ($crash && $candidateOps < (int) $progress['best_ops']) {
+        if (file_put_contents($bestScriptPath, $contents) === false) {
+            throw new RuntimeException("Failed to write best script snapshot: {$bestScriptPath}");
+        }
+        $progress['best_ops'] = $candidateOps;
+        $progress['best_command'] = render_best_command(
+            $phpBin,
+            $phpIni,
+            $config['php_args'],
+            $bestScriptPath,
+            $config['timeout_seconds'],
+            $timeoutBin,
+            $valgrindBin
+        );
+    }
+    if ($screenMode) {
+        maybe_render_progress_screen($progress, $config['render_interval'], $lastRenderAt, true);
+    }
+
     $result = $crash ? 'crash' : 'no crash';
     $details = [];
     if (!empty($run['timed_out'])) {
@@ -902,22 +1193,24 @@ $test = function (array $candidateOperationIds) use (
     }
     $detailSuffix = $details !== [] ? ' [' . implode(', ', $details) . ']' : '';
 
-    fwrite(
-        STDOUT,
-        sprintf(
-            "test #%d: ops=%d => %s after %d/%d runs (exit %d%s)%s\n",
-            $testCount,
-            count($candidateOperationIds),
-            $result,
-            $runResult['attempts'],
-            $config['max_runs'],
-            $run['exit_code'],
-            $run['signal'] !== null ? sprintf(', signal %d', $run['signal']) : '',
-            $detailSuffix
-        )
-    );
+    if (!$screenMode) {
+        fwrite(
+            STDOUT,
+            sprintf(
+                "test #%d: ops=%d => %s after %d/%d runs (exit %d%s)%s\n",
+                $testCount,
+                $candidateOps,
+                $result,
+                $runResult['attempts'],
+                $config['max_runs'],
+                $run['exit_code'],
+                $run['signal'] !== null ? sprintf(', signal %d', $run['signal']) : '',
+                $detailSuffix
+            )
+        );
+    }
 
-    if ($config['verbosity'] >= 1) {
+    if (!$screenMode && $config['verbosity'] >= 1) {
         $workers = [];
         foreach ($candidateOperationIds as $operationId) {
             $worker = $operations[$operationId]['worker'];
@@ -931,7 +1224,7 @@ $test = function (array $candidateOperationIds) use (
         fwrite(STDOUT, '  candidate workers: ' . implode(', ', $workerParts) . "\n");
     }
 
-    if ($testCount === 1 || $config['verbosity'] >= 1) {
+    if (!$screenMode && ($testCount === 1 || $config['verbosity'] >= 1)) {
         fwrite(STDOUT, "Command: {$run['command']}\n");
         fwrite(STDOUT, "Cwd: {$run['cwd']}\n");
     }
@@ -957,12 +1250,29 @@ if ($finalCount >= $originalCount) {
 $finalSet = array_fill_keys($reducedOperations, true);
 $finalContents = build_script($lines, $operations, $finalSet);
 
-$scriptPathWithoutExtension = preg_replace('/\.php$/', '', $scriptPath);
-$outputPath = ($scriptPathWithoutExtension ?? $scriptPath) . '.final-reduced-script.php';
-
 if (file_put_contents($outputPath, $finalContents) === false) {
     fail("Failed to write reduced script: {$outputPath}");
 }
 
+if (file_put_contents($bestScriptPath, $finalContents) === false) {
+    fail("Failed to write best script snapshot: {$bestScriptPath}");
+}
+
+if ($screenMode) {
+    $progress['best_ops'] = $finalCount;
+    $progress['best_command'] = render_best_command(
+        $phpBin,
+        $phpIni,
+        $config['php_args'],
+        $bestScriptPath,
+        $config['timeout_seconds'],
+        $timeoutBin,
+        $valgrindBin
+    );
+    maybe_render_progress_screen($progress, $config['render_interval'], $lastRenderAt, true);
+    fwrite(STDOUT, "\n");
+}
+
 fwrite(STDOUT, sprintf("Reduced %d operations to %d operations.\n", $originalCount, $finalCount));
 fwrite(STDOUT, "Reduced script: {$outputPath}\n");
+fwrite(STDOUT, "Best-progress script: {$bestScriptPath}\n");

@@ -82,6 +82,16 @@ details (including command lines and stdout/stderr byte counts):
   reproducers/reproducing/.../reproducer.php
 ```
 
+For long-running reductions, use a live updating screen that refreshes every
+second and shows elapsed time, iteration progress, and the current best script
+plus a copy/paste command line:
+
+```bash
+./bin/final-reduce-script --progress-mode screen --interval 1.0 \
+  --php-bin ./php85d --max-runs 5 \
+  reproducers/reproducing/.../reproducer.php
+```
+
 ## Complex example of running the harness
 
 Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under
