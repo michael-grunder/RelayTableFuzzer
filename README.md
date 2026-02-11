@@ -59,6 +59,21 @@ multi-line calls) while preserving crashing behavior:
   reproducers/reproducing/20260210_230216_fd61f666/reproducer.php
 ```
 
+To reduce infinite-loop reproducers, bound each run with `--timeout`:
+
+```bash
+./bin/final-reduce-script --php-bin ./php85d --timeout 10 \
+  reproducers/reproducing/.../reproducer.php
+```
+
+To only treat valgrind memory errors as crashes, use `--valgrind` (runs with
+`USE_ZEND_ALLOC=0`, ignores leaks, and looks at valgrind's error summary):
+
+```bash
+./bin/final-reduce-script --php-bin ./php85d --valgrind --max-runs 5 \
+  reproducers/reproducing/.../reproducer.php
+```
+
 ## Complex example of running the harness
 
 Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under

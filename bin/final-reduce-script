@@ -13,6 +13,8 @@ Options:
   --php-bin PATH       Path to PHP binary (default: current PHP)
   --php-ini PATH       Path to php.ini (optional)
   --max-runs N         Number of attempts per candidate (default: 1)
+  --timeout N          Kill runs that exceed N seconds
+  --valgrind[=PATH]    Run under valgrind (default binary: valgrind)
   --help               Show this help
 
 Notes:
@@ -20,7 +22,7 @@ Notes:
   - You can also pass "-d value" and both parts will be forwarded.
 
 Example:
-  bin/final-reduce-script --php-bin ./php85d --php-ini relay.ini --max-runs 10 \
+  bin/final-reduce-script --php-bin ./php85d --php-ini relay.ini --max-runs 10 --timeout 10 \
     -drelay.maxmemory=12345 reproducers/reproducing/.../reproducer.php
 
 TEXT;
@@ -40,6 +42,8 @@ function parse_args(array $argv): array
     $phpBin = PHP_BINARY;
     $phpIni = null;
     $maxRuns = 1;
+    $timeoutSeconds = null;
+    $valgrindBin = null;
     $phpArgs = [];
     $scriptPath = null;
 
@@ -90,6 +94,32 @@ function parse_args(array $argv): array
             continue;
         }
 
+        if (str_starts_with($arg, '--timeout=')) {
+            $timeoutSeconds = parse_timeout_seconds(substr($arg, strlen('--timeout=')));
+            continue;
+        }
+        if ($arg === '--timeout') {
+            $i++;
+            if (!isset($args[$i])) {
+                fail("Missing value for --timeout");
+            }
+            $timeoutSeconds = parse_timeout_seconds($args[$i]);
+            continue;
+        }
+
+        if ($arg === '--valgrind') {
+            $valgrindBin = 'valgrind';
+            continue;
+        }
+        if (str_starts_with($arg, '--valgrind=')) {
+            $value = substr($arg, strlen('--valgrind='));
+            if ($value === '') {
+                fail('--valgrind requires a binary path or name');
+            }
+            $valgrindBin = $value;
+            continue;
+        }
+
         if (str_starts_with($arg, '--')) {
             fail("Unknown option: {$arg}");
         }
@@ -124,6 +154,8 @@ function parse_args(array $argv): array
         'php_bin' => $phpBin,
         'php_ini' => $phpIni,
         'max_runs' => $maxRuns,
+        'timeout_seconds' => $timeoutSeconds,
+        'valgrind_bin' => $valgrindBin,
         'php_args' => $phpArgs,
         'script_path' => $scriptPath,
     ];
@@ -141,6 +173,78 @@ function parse_max_runs(string $raw): int
     }
 
     return $maxRuns;
+}
+
+function parse_timeout_seconds(string $raw): int
+{
+    if ($raw === '' || preg_match('/^\d+$/', $raw) !== 1) {
+        fail("Invalid --timeout value: {$raw}");
+    }
+
+    $timeout = (int) $raw;
+    if ($timeout < 1) {
+        fail('--timeout must be >= 1');
+    }
+
+    return $timeout;
+}
+
+function resolve_executable_path(string $binary): string
+{
+    if ($binary === '') {
+        return $binary;
+    }
+    if (str_contains($binary, '/')) {
+        $real = realpath($binary);
+        return $real !== false ? $real : $binary;
+    }
+
+    $path = getenv('PATH');
+    if (!is_string($path) || $path === '') {
+        return $binary;
+    }
+
+    foreach (explode(PATH_SEPARATOR, $path) as $dir) {
+        if ($dir === '') {
+            continue;
+        }
+        $candidate = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $binary;
+        if (is_file($candidate) && is_executable($candidate)) {
+            return $candidate;
+        }
+    }
+
+    return $binary;
+}
+
+function create_temp_log(string $prefix): ?string
+{
+    $path = tempnam(sys_get_temp_dir(), $prefix);
+    return $path !== false ? $path : null;
+}
+
+function parse_valgrind_error_count(?string $path): ?int
+{
+    if (!is_string($path) || $path === '' || !is_file($path)) {
+        return null;
+    }
+
+    $lines = @file($path, FILE_IGNORE_NEW_LINES);
+    if ($lines === false) {
+        return null;
+    }
+
+    for ($i = count($lines) - 1; $i >= 0; $i--) {
+        $line = trim($lines[$i]);
+        if ($line === '') {
+            continue;
+        }
+        if (preg_match('/ERROR\s+SUMMARY:\s*(\d+)\s+errors/i', $line, $matches) === 1) {
+            return (int) $matches[1];
+        }
+    }
+
+    return null;
 }
 
 function comment_out_line(string $line): string
@@ -318,8 +422,30 @@ function write_temp_script(string $dir, string $contents): string
     return $tmpPhp;
 }
 
-function run_php_once(string $phpBin, ?string $phpIni, array $phpArgs, string $scriptPath, string $cwd): array
+function build_valgrind_command(string $valgrindBin, string $logPath, array $command): array
 {
+    return [
+        'env',
+        'USE_ZEND_ALLOC=0',
+        $valgrindBin,
+        '--tool=memcheck',
+        '--leak-check=no',
+        '--errors-for-leak-kinds=none',
+        '--log-file=' . $logPath,
+        ...$command,
+    ];
+}
+
+function run_php_once(
+    string $phpBin,
+    ?string $phpIni,
+    array $phpArgs,
+    string $scriptPath,
+    string $cwd,
+    ?int $timeoutSeconds,
+    ?string $timeoutBin,
+    ?string $valgrindBin
+): array {
     $args = [$phpBin, ...$phpArgs];
     if ($phpIni !== null && $phpIni !== '') {
         $args[] = '-c';
@@ -327,7 +453,20 @@ function run_php_once(string $phpBin, ?string $phpIni, array $phpArgs, string $s
     }
     $args[] = $scriptPath;
 
-    $command = implode(' ', array_map('escapeshellarg', $args));
+    $valgrindLogPath = null;
+    $exec = $args;
+    if ($valgrindBin !== null) {
+        $valgrindLogPath = create_temp_log('final-reduce-script-vg-');
+        if ($valgrindLogPath === null) {
+            throw new RuntimeException('Failed to create valgrind log file');
+        }
+        $exec = build_valgrind_command($valgrindBin, $valgrindLogPath, $exec);
+    }
+    if ($timeoutSeconds !== null && $timeoutBin !== null) {
+        $exec = [$timeoutBin, (string) $timeoutSeconds, ...$exec];
+    }
+
+    $command = implode(' ', array_map('escapeshellarg', $exec));
 
     $descriptors = [
         0 => ['pipe', 'r'],
@@ -336,7 +475,7 @@ function run_php_once(string $phpBin, ?string $phpIni, array $phpArgs, string $s
     ];
 
     $pipes = [];
-    $proc = proc_open($command, $descriptors, $pipes, $cwd);
+    $proc = proc_open($exec, $descriptors, $pipes, $cwd);
     if (!is_resource($proc)) {
         throw new RuntimeException('Failed to execute PHP binary');
     }
@@ -370,11 +509,19 @@ function run_php_once(string $phpBin, ?string $phpIni, array $phpArgs, string $s
         $finalExit = 1;
     }
 
+    $timedOut = $timeoutSeconds !== null && $finalExit === 124;
+    $valgrindErrors = parse_valgrind_error_count($valgrindLogPath);
+    if ($valgrindLogPath !== null) {
+        @unlink($valgrindLogPath);
+    }
+
     return [
         'command' => $command,
         'cwd' => $cwd,
         'exit_code' => $finalExit,
         'signal' => $signal,
+        'timed_out' => $timedOut,
+        'valgrind_errors' => $valgrindErrors,
         'stdout' => $stdout,
         'stderr' => $stderr,
     ];
@@ -385,20 +532,43 @@ function is_crash(int $exitCode): bool
     return $exitCode >= 128;
 }
 
+function classify_crash(array $run, bool $usesValgrind): bool
+{
+    if ($usesValgrind) {
+        $errors = $run['valgrind_errors'] ?? null;
+        return is_int($errors) && $errors > 0;
+    }
+
+    return is_crash((int) $run['exit_code']) || !empty($run['timed_out']);
+}
+
 function run_php_with_retries(
     string $phpBin,
     ?string $phpIni,
     array $phpArgs,
     string $scriptPath,
     string $cwd,
-    int $maxRuns
+    int $maxRuns,
+    ?int $timeoutSeconds,
+    ?string $timeoutBin,
+    ?string $valgrindBin
 ): array {
     $lastRun = null;
+    $usesValgrind = $valgrindBin !== null;
 
     for ($attempt = 1; $attempt <= $maxRuns; $attempt++) {
-        $run = run_php_once($phpBin, $phpIni, $phpArgs, $scriptPath, $cwd);
+        $run = run_php_once(
+            $phpBin,
+            $phpIni,
+            $phpArgs,
+            $scriptPath,
+            $cwd,
+            $timeoutSeconds,
+            $timeoutBin,
+            $valgrindBin
+        );
         $lastRun = $run;
-        if (is_crash($run['exit_code'])) {
+        if (classify_crash($run, $usesValgrind)) {
             return [
                 'is_crash' => true,
                 'attempts' => $attempt,
@@ -468,13 +638,9 @@ if ($scriptPath === false || !is_file($scriptPath)) {
     fail("Script not found: {$config['script_path']}");
 }
 
-$phpBin = $config['php_bin'];
-if (!is_file($phpBin)) {
+$phpBin = resolve_executable_path($config['php_bin']);
+if (!is_file($phpBin) || !is_executable($phpBin)) {
     fail("PHP binary not found: {$phpBin}");
-}
-$resolvedBin = realpath($phpBin);
-if ($resolvedBin !== false) {
-    $phpBin = $resolvedBin;
 }
 
 $phpIni = $config['php_ini'];
@@ -484,6 +650,22 @@ if ($phpIni !== null && $phpIni !== '') {
         fail("PHP ini not found: {$phpIni}");
     }
     $phpIni = $resolvedIni;
+}
+
+$timeoutBin = null;
+if (is_int($config['timeout_seconds'])) {
+    $timeoutBin = resolve_executable_path('timeout');
+    if (!is_file($timeoutBin) || !is_executable($timeoutBin)) {
+        fail('timeout binary not found or not executable: timeout');
+    }
+}
+
+$valgrindBin = null;
+if (is_string($config['valgrind_bin'])) {
+    $valgrindBin = resolve_executable_path($config['valgrind_bin']);
+    if (!is_file($valgrindBin) || !is_executable($valgrindBin)) {
+        fail("valgrind binary not found or not executable: {$config['valgrind_bin']}");
+    }
 }
 
 $lines = file($scriptPath);
@@ -513,6 +695,12 @@ fwrite(STDOUT, "PHP bin: {$phpBin}\n");
 if ($phpIni !== null && $phpIni !== '') {
     fwrite(STDOUT, "PHP ini: {$phpIni}\n");
 }
+if (is_int($config['timeout_seconds']) && is_string($timeoutBin)) {
+    fwrite(STDOUT, "Timeout: {$config['timeout_seconds']}s ({$timeoutBin})\n");
+}
+if ($valgrindBin !== null) {
+    fwrite(STDOUT, "Valgrind: {$valgrindBin} (USE_ZEND_ALLOC=0)\n");
+}
 if ($config['php_args'] !== []) {
     fwrite(
         STDOUT,
@@ -536,7 +724,9 @@ $test = function (array $candidateOperationIds) use (
     $phpBin,
     $phpIni,
     $config,
-    $scriptDir
+    $scriptDir,
+    $timeoutBin,
+    $valgrindBin
 ): bool {
     $testCount++;
 
@@ -550,7 +740,10 @@ $test = function (array $candidateOperationIds) use (
         $config['php_args'],
         $tmpScript,
         $scriptDir,
-        $config['max_runs']
+        $config['max_runs'],
+        $config['timeout_seconds'],
+        $timeoutBin,
+        $valgrindBin
     );
 
     @unlink($tmpScript);
@@ -562,18 +755,28 @@ $test = function (array $candidateOperationIds) use (
 
     $crash = (bool) $runResult['is_crash'];
     $result = $crash ? 'crash' : 'no crash';
+    $details = [];
+    if (!empty($run['timed_out'])) {
+        $details[] = 'timeout';
+    }
+    $valgrindErrors = $run['valgrind_errors'] ?? null;
+    if (is_int($valgrindErrors)) {
+        $details[] = "valgrind_errors={$valgrindErrors}";
+    }
+    $detailSuffix = $details !== [] ? ' [' . implode(', ', $details) . ']' : '';
 
     fwrite(
         STDOUT,
         sprintf(
-            "test #%d: ops=%d => %s after %d/%d runs (exit %d%s)\n",
+            "test #%d: ops=%d => %s after %d/%d runs (exit %d%s)%s\n",
             $testCount,
             count($candidateOperationIds),
             $result,
             $runResult['attempts'],
             $config['max_runs'],
             $run['exit_code'],
-            $run['signal'] !== null ? sprintf(', signal %d', $run['signal']) : ''
+            $run['signal'] !== null ? sprintf(', signal %d', $run['signal']) : '',
+            $detailSuffix
         )
     );
 
@@ -586,7 +789,10 @@ $test = function (array $candidateOperationIds) use (
 };
 
 if (!$test($activeOperations)) {
-    fail('Baseline did not crash within max runs; cannot reduce.');
+    if ($valgrindBin !== null) {
+        fail('Baseline did not report valgrind memory errors within max runs; cannot reduce.');
+    }
+    fail('Baseline did not crash or time out within max runs; cannot reduce.');
 }
 
 $reducedOperations = ddmin($activeOperations, $test);
