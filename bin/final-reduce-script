@@ -1223,6 +1223,7 @@ HELP);
 
         if ($finalCount >= $originalCount) {
             $io->writeln("No reduction possible (still {$originalCount} operations).");
+            $io->writeln("Best command: {$progress['best_command']}");
             return Command::SUCCESS;
         }
 
@@ -1256,6 +1257,7 @@ HELP);
         $io->writeln(sprintf('Reduced %d operations to %d operations.', $originalCount, $finalCount));
         $io->writeln("Reduced script: {$outputPath}");
         $io->writeln("Best-progress script: {$bestScriptPath}");
+        $io->writeln("Best command: {$progress['best_command']}");
 
         return Command::SUCCESS;
     }

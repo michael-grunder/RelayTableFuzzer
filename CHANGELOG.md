@@ -19,5 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bin/reprodcuers` now aggregates entries from `reproducing` and `non-reproducing`, supports `--reproducing` and `--non-reproducing` filters, and sorts by `reproducer.php` line count by default.
 - Reworked `bin/final-reduce-script` to use Symfony Console command parsing/output/error handling and Console sections for live screen redraws.
 - `bin/final-reduce-script --progress-mode=screen` now includes elapsed time since the last best reduction, so long gaps between improvements are visible.
+- `bin/final-reduce-script` now prints a final `Best command: ...` line in plain output mode for quick copy/paste reruns.
 ### Fixed
 ### Internal

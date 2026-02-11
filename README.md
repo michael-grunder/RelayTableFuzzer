@@ -92,6 +92,9 @@ progress, and the current best script plus a copy/paste command line:
   reproducers/reproducing/.../reproducer.php
 ```
 
+At the end of a run, `bin/final-reduce-script` also prints `Best command: ...`
+in plain output mode so you can copy/paste the exact reducer command.
+
 ## Complex example of running the harness
 
 Run 36 parallel fuzzing jobs where we generate a PHP script and then run it under
