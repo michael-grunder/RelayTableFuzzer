@@ -17,5 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run-reproducer.sh` now uses absolute paths and copies the active php.ini into the reproducer directory.
 - `run-reproducer.sh` now resolves the script directory at runtime for reproducer-local paths.
 - `bin/reprodcuers` now aggregates entries from `reproducing` and `non-reproducing`, supports `--reproducing` and `--non-reproducing` filters, and sorts by `reproducer.php` line count by default.
+- Reworked `bin/final-reduce-script` to use Symfony Console command parsing/output/error handling and Console sections for live screen redraws.
+- `bin/final-reduce-script --progress-mode=screen` now includes elapsed time since the last best reduction, so long gaps between improvements are visible.
 ### Fixed
 ### Internal

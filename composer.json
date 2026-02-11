@@ -16,7 +16,8 @@
         }
     ],
     "require": {
-        "monolog/monolog": "^3.10"
+        "monolog/monolog": "^3.10",
+        "symfony/console": "^8.0"
     },
     "require-dev": {
         "phpstan/phpstan": "^2.1"

@@ -83,8 +83,8 @@ details (including command lines and stdout/stderr byte counts):
 ```
 
 For long-running reductions, use a live updating screen that refreshes every
-second and shows elapsed time, iteration progress, and the current best script
-plus a copy/paste command line:
+second and shows elapsed time, elapsed time since the last reduction, iteration
+progress, and the current best script plus a copy/paste command line:
 
 ```bash
 ./bin/final-reduce-script --progress-mode screen --interval 1.0 \
