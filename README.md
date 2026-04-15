@@ -103,6 +103,9 @@ the fuzzer will try to reduce it to the smallest possible program that still has
 a memory error.
 
 **Note**: Valgrind is optional. Without valgrind we will just detect if the process exits with a crashing signal.
+When `--timeout` fires, the harness now captures live `gdb` backtraces into the
+saved reproducer directory as `gdb-timeout-backtrace.txt` and
+`gdb-timeout-backtrace-simple.txt` before killing the stuck process.
 
 ```bash
 ./bin/harness \

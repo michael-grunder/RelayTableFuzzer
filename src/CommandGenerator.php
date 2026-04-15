@@ -41,7 +41,7 @@ final class CommandGenerator
                 break;
         }
 
-        $effectiveOp = $cmd['op'] ?? $op;
+        $effectiveOp = $cmd['op'];
         if (!in_array($effectiveOp, ['namespaces', 'clearAll'], true)) {
             $cmd['namespace'] = $this->pickNamespace($namespaces);
         }

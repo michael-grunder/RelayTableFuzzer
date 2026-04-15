@@ -20,5 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reworked `bin/final-reduce-script` to use Symfony Console command parsing/output/error handling and Console sections for live screen redraws.
 - `bin/final-reduce-script --progress-mode=screen` now includes elapsed time since the last best reduction, so long gaps between improvements are visible.
 - `bin/final-reduce-script` now prints a final `Best command: ...` line in plain output mode for quick copy/paste reruns.
+- `bin/harness --timeout` now manages deadlines internally, reaps timed out children itself, and saves live `gdb` timeout backtraces into reproducer directories.
 ### Fixed
 ### Internal

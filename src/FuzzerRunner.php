@@ -225,10 +225,11 @@ final class FuzzerRunner
 
         switch ($op) {
             case 'get':
-                Table::get((string) $cmd['key'], $namespace);
+                $this->invokeTableMethod('get', (string) $cmd['key'], $namespace);
                 break;
             case 'set':
-                Table::set(
+                $this->invokeTableMethod(
+                    'set',
                     (string) $cmd['key'],
                     $cmd['value'] ?? null,
                     $cmd['expire'] ?? null,
@@ -236,29 +237,34 @@ final class FuzzerRunner
                 );
                 break;
             case 'exists':
-                Table::exists((string) $cmd['key'], $namespace);
+                $this->invokeTableMethod('exists', (string) $cmd['key'], $namespace);
                 break;
             case 'delete':
-                Table::delete((string) $cmd['key'], $namespace);
+                $this->invokeTableMethod('delete', (string) $cmd['key'], $namespace);
                 break;
             case 'ttl':
-                Table::ttl((string) $cmd['key'], $namespace);
+                $this->invokeTableMethod('ttl', (string) $cmd['key'], $namespace);
                 break;
             case 'count':
-                Table::count($namespace);
+                $this->invokeTableMethod('count', $namespace);
                 break;
             case 'clear':
-                Table::clear($namespace);
+                $this->invokeTableMethod('clear', $namespace);
                 break;
             case 'namespaces':
-                Table::namespaces();
+                $this->invokeTableMethod('namespaces');
                 break;
             case 'clearAll':
-                Table::clearAll();
+                $this->invokeTableMethod('clearAll');
                 break;
             default:
                 break;
         }
+    }
+
+    private function invokeTableMethod(string $method, mixed ...$args): mixed
+    {
+        return call_user_func([Table::class, $method], ...$args);
     }
 
     private function printStatus(string $message): void

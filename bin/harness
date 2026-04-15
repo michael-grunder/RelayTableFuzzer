@@ -123,16 +123,14 @@ function create_temp_log(string $prefix): ?string
 function build_exec_command(
     array $command,
     ?string $valgrindBin,
-    ?string $valgrindLogPath,
-    ?int $maxSeconds,
-    ?string $timeoutSignalArg
+    ?string $valgrindLogPath
 ): array {
     $exec = $command;
     if ($valgrindBin !== null && $valgrindLogPath !== null) {
         $exec = build_valgrind_command($valgrindBin, $valgrindLogPath, $exec);
     }
 
-    return wrap_timeout_command($exec, $maxSeconds, $timeoutSignalArg);
+    return $exec;
 }
 
 function resolve_executable_path(string $binary): string
@@ -583,34 +581,6 @@ function parse_timeout_signal(?string $value): ?array
     return ['arg' => $name, 'num' => (int)constant($name)];
 }
 
-function wrap_timeout_command(array $command, ?int $maxSeconds, ?string $timeoutSignalArg): array
-{
-    if ($maxSeconds === null) {
-        return $command;
-    }
-
-    $wrapped = ['timeout'];
-    if ($timeoutSignalArg !== null) {
-        $wrapped[] = '--signal=' . $timeoutSignalArg;
-    }
-    $wrapped[] = (string)$maxSeconds;
-
-    return array_merge($wrapped, $command);
-}
-
-function is_timeout_exit(int $exitCode, ?int $timeoutSignal): bool
-{
-    if ($exitCode === 124) {
-        return true;
-    }
-
-    if ($timeoutSignal !== null && $exitCode === 128 + $timeoutSignal) {
-        return true;
-    }
-
-    return false;
-}
-
 function run_command(
     array $fullCommand,
     string $phpBin,
@@ -633,7 +603,7 @@ function run_command(
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath, $maxSeconds, $timeoutSignalArg);
+    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath);
     $process = proc_open($execCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
@@ -642,12 +612,26 @@ function run_command(
 
     $status = proc_get_status($process);
     $pid = $status['pid'] ?? null;
-    if ($maxSeconds !== null) {
-        $pid = null;
-    }
     $start = microtime(true);
+    $timeoutBacktracePath = null;
+    $timeoutBacktraceSimplePath = null;
+    $timedOut = false;
+    $timeoutRequestedAt = null;
 
     while ($status['running']) {
+        if (
+            !$timedOut
+            && $maxSeconds !== null
+            && (microtime(true) - $start) >= $maxSeconds
+        ) {
+            $timedOut = true;
+            [$timeoutBacktracePath, $timeoutBacktraceSimplePath] = capture_timeout_backtraces($pid);
+            proc_terminate($process, $timeoutSignal ?? SIGTERM);
+            $timeoutRequestedAt = microtime(true);
+        } elseif ($timedOut && $timeoutRequestedAt !== null && (microtime(true) - $timeoutRequestedAt) >= 1.0) {
+            proc_terminate($process, SIGKILL);
+        }
+
         usleep(10000);
         $status = proc_get_status($process);
     }
@@ -663,7 +647,6 @@ function run_command(
     }
 
     $exitCode = proc_close($process);
-    $timedOut = $maxSeconds !== null ? is_timeout_exit($exitCode, $timeoutSignal) : false;
 
     $signal = null;
     if (($status['signaled'] ?? false) && isset($status['termsig'])) {
@@ -699,6 +682,8 @@ function run_command(
         'stderr_path' => $stderrPath !== false ? $stderrPath : null,
         'valgrind_log_path' => $valgrindLogPath,
         'valgrind_errors' => $valgrindErrors,
+        'timeout_backtrace_path' => $timeoutBacktracePath,
+        'timeout_backtrace_simple_path' => $timeoutBacktraceSimplePath,
     ];
 }
 
@@ -723,7 +708,7 @@ function start_command(
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath, $maxSeconds, $timeoutSignalArg);
+    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath);
     $process = proc_open($execCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         fwrite(STDERR, "Failed to start process\n");
@@ -734,7 +719,8 @@ function start_command(
 
     return [
         'process' => $process,
-        'pid' => $maxSeconds !== null ? null : ($status['pid'] ?? null),
+        'pid' => $status['pid'] ?? null,
+        'max_seconds' => $maxSeconds,
         'start_time' => microtime(true),
         'php_bin' => $phpBin,
         'stdout_path' => $stdoutPath !== false ? $stdoutPath : null,
@@ -745,6 +731,8 @@ function start_command(
         'timeout_signal' => $timeoutSignal,
         'timeout_signal_arg' => $timeoutSignalArg,
         'valgrind_log_path' => $valgrindLogPath,
+        'timeout_backtrace_path' => null,
+        'timeout_backtrace_simple_path' => null,
         'command_string' => render_command($execCommand),
     ];
 }
@@ -752,7 +740,7 @@ function start_command(
 function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $onlyCrashes): array
 {
     $exitCode = proc_close($job['process']);
-    $timedOut = (!empty($job['uses_timeout']) && is_timeout_exit($exitCode, $timeoutSignal));
+    $timedOut = (bool)($job['timed_out'] ?? false);
 
     $signal = null;
     if (($status['signaled'] ?? false) && isset($status['termsig'])) {
@@ -791,6 +779,8 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $
         'stderr_path' => $job['stderr_path'],
         'valgrind_log_path' => $job['valgrind_log_path'] ?? null,
         'valgrind_errors' => $valgrindErrors,
+        'timeout_backtrace_path' => $job['timeout_backtrace_path'] ?? null,
+        'timeout_backtrace_simple_path' => $job['timeout_backtrace_simple_path'] ?? null,
     ];
 }
 
@@ -805,6 +795,26 @@ function poll_command(array &$job, ?int $timeoutSignal, bool $onlyCrashes): ?arr
                 proc_terminate($job['process'], SIGKILL);
             }
             return null;
+        }
+
+        if (
+            empty($job['timed_out'])
+            && isset($job['max_seconds'])
+            && is_int($job['max_seconds'])
+            && (microtime(true) - ($job['start_time'] ?? 0.0)) >= $job['max_seconds']
+        ) {
+            $job['timed_out'] = true;
+            [$job['timeout_backtrace_path'], $job['timeout_backtrace_simple_path']] = capture_timeout_backtraces(
+                is_int($job['pid'] ?? null) ? $job['pid'] : null
+            );
+            proc_terminate($job['process'], $timeoutSignal ?? SIGTERM);
+            $job['timeout_requested_at'] = microtime(true);
+        } elseif (
+            !empty($job['timed_out'])
+            && isset($job['timeout_requested_at'])
+            && (microtime(true) - (float)$job['timeout_requested_at']) >= 1.0
+        ) {
+            proc_terminate($job['process'], SIGKILL);
         }
 
         return null;
@@ -857,7 +867,7 @@ function create_job(
     $job['php_args'] = $dynamicPhpArgs;
     $job['full_command'] = $fullCommand;
     $job['command_string'] = $job['command_string'] ?? render_command(
-        build_exec_command($fullCommand, $valgrindBin, $job['valgrind_log_path'] ?? null, $maxSeconds, $timeoutSignalArg)
+        build_exec_command($fullCommand, $valgrindBin, $job['valgrind_log_path'] ?? null)
     );
     $job['ops'] = $currentOps;
 
@@ -1063,7 +1073,7 @@ function create_script_job(
     $job['php_args'] = $dynamicPhpArgs;
     $job['full_command'] = $scriptCommand;
     $job['command_string'] = $job['command_string'] ?? render_command(
-        build_exec_command($scriptCommand, $valgrindBin, $job['valgrind_log_path'] ?? null, $maxSeconds, $timeoutSignalArg)
+        build_exec_command($scriptCommand, $valgrindBin, $job['valgrind_log_path'] ?? null)
     );
     $job['ops'] = $currentOps;
     $job['script_dir'] = $scriptDir;
@@ -1108,9 +1118,7 @@ function reduce_ops(
         $commandString = render_command(build_exec_command(
             $fullCommand,
             $valgrindBin,
-            $result['valgrind_log_path'] ?? null,
-            $maxSeconds,
-            $timeoutSignalArg
+            $result['valgrind_log_path'] ?? null
         ));
         $stats['runs']++;
         $stats['last_command'] = $commandString;
@@ -1182,9 +1190,7 @@ function reduce_ops_script(
         $commandString = render_command(build_exec_command(
             $scriptCommand,
             $valgrindBin,
-            $result['valgrind_log_path'] ?? null,
-            $maxSeconds,
-            $timeoutSignalArg
+            $result['valgrind_log_path'] ?? null
         ));
         $stats['runs']++;
         $stats['last_command'] = $commandString;
@@ -1276,6 +1282,74 @@ function run_gdb_backtrace(string $gdb, string $phpPath, string $coreFile, strin
     proc_close($process);
 }
 
+function run_gdb_process_backtrace(string $gdb, int $pid, string $tracePath, string $command): void
+{
+    $descriptorSpec = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['file', $tracePath, 'w'],
+        2 => ['file', $tracePath . '.err', 'w'],
+    ];
+    $gdbCommand = [
+        $gdb,
+        '-batch',
+        '-ex',
+        'set pagination off',
+        '-ex',
+        'set confirm off',
+        '-ex',
+        $command,
+        '-ex',
+        'detach',
+        '-p',
+        (string)$pid,
+    ];
+    $process = proc_open($gdbCommand, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        file_put_contents($tracePath, "failed to start gdb\n");
+        return;
+    }
+
+    $status = proc_get_status($process);
+    while (($status['running'] ?? false) === true) {
+        usleep(10000);
+        $status = proc_get_status($process);
+    }
+
+    proc_close($process);
+}
+
+function capture_timeout_backtraces(?int $pid): array
+{
+    $fullTracePath = create_temp_log('relay-harness-timeout-bt-');
+    $simpleTracePath = create_temp_log('relay-harness-timeout-bt-simple-');
+    if ($fullTracePath === null || $simpleTracePath === null) {
+        foreach ([$fullTracePath, $simpleTracePath] as $path) {
+            if (is_string($path) && $path !== '' && file_exists($path)) {
+                @unlink($path);
+            }
+        }
+        return [null, null];
+    }
+
+    if ($pid === null) {
+        file_put_contents($fullTracePath, "process pid unavailable for timeout backtrace\n");
+        file_put_contents($simpleTracePath, "process pid unavailable for timeout backtrace\n");
+        return [$fullTracePath, $simpleTracePath];
+    }
+
+    $gdb = find_gdb_binary();
+    if ($gdb === null) {
+        file_put_contents($fullTracePath, "gdb not found in PATH\n");
+        file_put_contents($simpleTracePath, "gdb not found in PATH\n");
+        return [$fullTracePath, $simpleTracePath];
+    }
+
+    run_gdb_process_backtrace($gdb, $pid, $fullTracePath, 'thread apply all bt full');
+    run_gdb_process_backtrace($gdb, $pid, $simpleTracePath, 'thread apply all bt');
+
+    return [$fullTracePath, $simpleTracePath];
+}
+
 function generate_gdb_backtraces(array $coreFiles, string $destinationDir, string $phpBin): void
 {
     if ($coreFiles === []) {
@@ -1329,7 +1403,7 @@ function move_core_dumps(array $coreFiles, string $destinationDir): array
 
 function cleanup_output_files(array $result): void
 {
-    foreach (['stdout_path', 'stderr_path', 'valgrind_log_path'] as $key) {
+    foreach (['stdout_path', 'stderr_path', 'valgrind_log_path', 'timeout_backtrace_path', 'timeout_backtrace_simple_path'] as $key) {
         $path = $result[$key] ?? null;
         if (is_string($path) && $path !== '' && file_exists($path)) {
             @unlink($path);
@@ -1344,6 +1418,8 @@ function move_output_files(array $result, string $destinationDir): array
         'stdout_path' => 'stdout.log',
         'stderr_path' => 'stderr.log',
         'valgrind_log_path' => 'valgrind.log',
+        'timeout_backtrace_path' => 'gdb-timeout-backtrace.txt',
+        'timeout_backtrace_simple_path' => 'gdb-timeout-backtrace-simple.txt',
     ];
 
     foreach ($mapping as $key => $targetName) {
@@ -1368,6 +1444,25 @@ function move_output_files(array $result, string $destinationDir): array
     }
 
     return $moved;
+}
+
+function rename_output_file(string $destinationDir, string $sourceName, string $targetName): void
+{
+    if ($sourceName === $targetName) {
+        return;
+    }
+
+    $sourcePath = $destinationDir . '/' . $sourceName;
+    $targetPath = $destinationDir . '/' . $targetName;
+    if (!is_file($sourcePath)) {
+        return;
+    }
+
+    if (is_file($targetPath)) {
+        @unlink($targetPath);
+    }
+
+    @rename($sourcePath, $targetPath);
 }
 
 function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $reproduced): string
@@ -1994,9 +2089,7 @@ while (true) {
                 $finalCommand = render_command(build_exec_command(
                     build_php_command($phpBin, $phpIni, $finalPhpArgs, $reducedArgs),
                     $valgrindBin,
-                    $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
-                    $maxSeconds,
-                    $timeoutSignalArg
+                    $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
                 ));
 
                 if ($finalCommand !== $crashJob['command_string']) {
@@ -2038,9 +2131,7 @@ while (true) {
             $finalCommand = render_command(build_exec_command(
                 build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
                 $valgrindBin,
-                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
-                $maxSeconds,
-                $timeoutSignalArg
+                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
             ));
             file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
             if ($finalGeneratorCommand !== null) {
@@ -2158,11 +2249,24 @@ while (true) {
                         $jobDir
                     );
                     if ($movedValgrind !== [] && $targetName !== 'valgrind.log') {
-                        $sourcePath = $jobDir . '/valgrind.log';
-                        $targetPath = $jobDir . '/' . $targetName;
-                        if (is_file($sourcePath)) {
-                            @rename($sourcePath, $targetPath);
-                        }
+                        rename_output_file($jobDir, 'valgrind.log', $targetName);
+                    }
+                }
+                if (!empty($reproducerResult['timeout_backtrace_path']) || !empty($reproducerResult['timeout_backtrace_simple_path'])) {
+                    move_output_files(
+                        [
+                            'timeout_backtrace_path' => $reproducerResult['timeout_backtrace_path'] ?? null,
+                            'timeout_backtrace_simple_path' => $reproducerResult['timeout_backtrace_simple_path'] ?? null,
+                        ],
+                        $jobDir
+                    );
+                    if ($reproTries > 1) {
+                        rename_output_file($jobDir, 'gdb-timeout-backtrace.txt', "gdb-timeout-backtrace-attempt-{$attempt}.txt");
+                        rename_output_file(
+                            $jobDir,
+                            'gdb-timeout-backtrace-simple.txt',
+                            "gdb-timeout-backtrace-simple-attempt-{$attempt}.txt"
+                        );
                     }
                 }
                 if (!empty($reproducerResult['core_files'])) {
@@ -2252,9 +2356,7 @@ while (true) {
             $finalCommand = render_command(build_exec_command(
                 build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
                 $valgrindBin,
-                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
-                $maxSeconds,
-                $timeoutSignalArg
+                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
             ));
             file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
             if ($finalGeneratorCommand !== null) {
@@ -2348,40 +2450,53 @@ while (true) {
                     ? "running leak reproducer ({$attempt}/{$reproTries})"
                     : 'running leak reproducer';
                 $reproducerResult = run_command(
-                $reproducerCommand,
-                $phpBin,
-                $maxSeconds,
-                $timeoutSignalArg,
-                $timeoutSignal,
-                $onlyCrashes,
-                $valgrindBin
-            );
-            $reproducerLeak = parse_php_leak_count(
-                $reproducerResult['stdout_path'],
-                $reproducerResult['stderr_path']
-            ) !== null;
-            if (!empty($reproducerResult['valgrind_errors'])) {
-                $targetName = $reproTries > 1
-                    ? "valgrind-leak-reproducer-attempt-{$attempt}.log"
-                    : 'valgrind-leak-reproducer.log';
-                $movedValgrind = move_output_files(
-                    [
-                        'valgrind_log_path' => $reproducerResult['valgrind_log_path'] ?? null,
-                    ],
-                    $jobDir
+                    $reproducerCommand,
+                    $phpBin,
+                    $maxSeconds,
+                    $timeoutSignalArg,
+                    $timeoutSignal,
+                    $onlyCrashes,
+                    $valgrindBin
                 );
-                if ($movedValgrind !== [] && $targetName !== 'valgrind.log') {
-                    $sourcePath = $jobDir . '/valgrind.log';
-                    $targetPath = $jobDir . '/' . $targetName;
-                    if (is_file($sourcePath)) {
-                        @rename($sourcePath, $targetPath);
+                $reproducerLeak = parse_php_leak_count(
+                    $reproducerResult['stdout_path'],
+                    $reproducerResult['stderr_path']
+                ) !== null;
+                if (!empty($reproducerResult['valgrind_errors'])) {
+                    $targetName = $reproTries > 1
+                        ? "valgrind-leak-reproducer-attempt-{$attempt}.log"
+                        : 'valgrind-leak-reproducer.log';
+                    $movedValgrind = move_output_files(
+                        [
+                            'valgrind_log_path' => $reproducerResult['valgrind_log_path'] ?? null,
+                        ],
+                        $jobDir
+                    );
+                    if ($movedValgrind !== [] && $targetName !== 'valgrind.log') {
+                        rename_output_file($jobDir, 'valgrind.log', $targetName);
                     }
                 }
-            }
-            if (!empty($reproducerResult['core_files'])) {
-                $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
-                generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
-            }
+                if (!empty($reproducerResult['timeout_backtrace_path']) || !empty($reproducerResult['timeout_backtrace_simple_path'])) {
+                    move_output_files(
+                        [
+                            'timeout_backtrace_path' => $reproducerResult['timeout_backtrace_path'] ?? null,
+                            'timeout_backtrace_simple_path' => $reproducerResult['timeout_backtrace_simple_path'] ?? null,
+                        ],
+                        $jobDir
+                    );
+                    if ($reproTries > 1) {
+                        rename_output_file($jobDir, 'gdb-timeout-backtrace.txt', "gdb-timeout-backtrace-attempt-{$attempt}.txt");
+                        rename_output_file(
+                            $jobDir,
+                            'gdb-timeout-backtrace-simple.txt',
+                            "gdb-timeout-backtrace-simple-attempt-{$attempt}.txt"
+                        );
+                    }
+                }
+                if (!empty($reproducerResult['core_files'])) {
+                    $reproducerCores = move_core_dumps($reproducerResult['core_files'], $jobDir);
+                    generate_gdb_backtraces($reproducerCores, $jobDir, $phpBin);
+                }
                 cleanup_output_files($reproducerResult);
                 if ($reproducerLeak) {
                     break;
