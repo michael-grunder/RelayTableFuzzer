@@ -328,6 +328,25 @@ function create_temp_dir(string $prefix): string
     return $tmp;
 }
 
+function create_reproducer_work_dir(string $storageDir): string
+{
+    $tmpRoot = $storageDir . '/.tmp';
+    if (!is_dir($tmpRoot) && !mkdir($tmpRoot, 0777, true) && !is_dir($tmpRoot)) {
+        fwrite(STDERR, "Failed to create temp dir root: {$tmpRoot}\n");
+        exit(1);
+    }
+
+    for ($attempt = 0; $attempt < 100; $attempt++) {
+        $jobDir = $tmpRoot . '/' . bin2hex(random_bytes(16));
+        if (@mkdir($jobDir, 0777)) {
+            return $jobDir;
+        }
+    }
+
+    fwrite(STDERR, "Failed to allocate reproducer temp dir in {$tmpRoot}\n");
+    exit(1);
+}
+
 function remove_dir_recursive(string $dir): void
 {
     if (!is_dir($dir)) {
@@ -457,7 +476,7 @@ function count_reproducer_dirs(string $reproducersDir): array
     }
 
     foreach ($entries as $entry) {
-        if ($entry === '.' || $entry === '..') {
+        if ($entry === '.' || $entry === '..' || str_starts_with($entry, '.')) {
             continue;
         }
         $dir = $reproducersDir . '/' . $entry;
@@ -1711,16 +1730,81 @@ function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $repro
 {
     $bucket = $reproduced ? 'reproducing' : 'non-reproducing';
     $bucketDir = $reproducersDir . '/' . $bucket;
-    if (!is_dir($bucketDir)) {
-        mkdir($bucketDir, 0777, true);
+    if (!is_dir($bucketDir) && !mkdir($bucketDir, 0777, true) && !is_dir($bucketDir)) {
+        return $jobDir;
     }
 
-    $targetDir = $bucketDir . '/' . basename($jobDir);
-    if (@rename($jobDir, $targetDir)) {
-        return $targetDir;
+    for ($sequence = next_reproducer_sequence($reproducersDir); $sequence < PHP_INT_MAX; $sequence++) {
+        $targetDir = $bucketDir . '/' . format_reproducer_sequence($sequence);
+        if (!@mkdir($targetDir, 0777)) {
+            continue;
+        }
+
+        if (move_dir_contents($jobDir, $targetDir)) {
+            @rmdir($jobDir);
+            return $targetDir;
+        }
+
+        remove_dir_recursive($targetDir);
+        return $jobDir;
     }
 
     return $jobDir;
+}
+
+function next_reproducer_sequence(string $storageDir): int
+{
+    $max = 0;
+    foreach (['reproducing', 'non-reproducing'] as $bucket) {
+        $bucketDir = $storageDir . '/' . $bucket;
+        if (!is_dir($bucketDir)) {
+            continue;
+        }
+
+        $entries = scandir($bucketDir);
+        if ($entries === false) {
+            continue;
+        }
+
+        foreach ($entries as $entry) {
+            if (preg_match('/^[0-9]+$/', $entry) !== 1) {
+                continue;
+            }
+            $max = max($max, (int) $entry);
+        }
+    }
+
+    return $max + 1;
+}
+
+function format_reproducer_sequence(int $sequence): string
+{
+    return str_pad((string) $sequence, 4, '0', STR_PAD_LEFT);
+}
+
+function move_dir_contents(string $sourceDir, string $targetDir): bool
+{
+    $entries = scandir($sourceDir);
+    if ($entries === false) {
+        return false;
+    }
+
+    $moved = [];
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+
+        if (!@rename($sourceDir . '/' . $entry, $targetDir . '/' . $entry)) {
+            foreach (array_reverse($moved) as $movedEntry) {
+                @rename($targetDir . '/' . $movedEntry, $sourceDir . '/' . $movedEntry);
+            }
+            return false;
+        }
+        $moved[] = $entry;
+    }
+
+    return true;
 }
 
 function parse_relay_memory_from_output(?string $stdoutPath): ?array
@@ -2280,9 +2364,7 @@ while (true) {
     );
 
     if ($crashResult !== null && $runningJobs === []) {
-        $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
-        $jobDir = $reproducersDir . '/' . $jobId;
-        mkdir($jobDir, 0777, true);
+        $jobDir = create_reproducer_work_dir($reproducersDir);
 
         $finalCommand = $crashJob['command_string'];
         $finalOps = $currentOps;
@@ -2555,9 +2637,7 @@ while (true) {
     }
 
     if ($leakResult !== null && $runningJobs === []) {
-        $jobId = date('Ymd_His') . '_' . bin2hex(random_bytes(4));
-        $jobDir = $leaksDir . '/' . $jobId;
-        mkdir($jobDir, 0777, true);
+        $jobDir = create_reproducer_work_dir($leaksDir);
 
         $finalCommand = $leakJob['command_string'];
         $finalOps = $currentOps;

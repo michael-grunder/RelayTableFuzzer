@@ -186,7 +186,7 @@ function collect_rows(string $reproducersDir, ?string $statusFilter): array
 
     $bucketDirs = [];
     foreach ($entries as $entry) {
-        if ($entry === '.' || $entry === '..') {
+        if ($entry === '.' || $entry === '..' || str_starts_with($entry, '.')) {
             continue;
         }
         $dir = $reproducersDir . '/' . $entry;

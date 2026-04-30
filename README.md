@@ -56,7 +56,7 @@ multi-line calls) while preserving crashing behavior:
 ```bash
 ./bin/final-reduce-script --php-bin ./php85d --php-ini ./relay.ini --max-runs 10 \
   -drelay.maxmemory=206715 \
-  reproducers/reproducing/20260210_230216_fd61f666/reproducer.php
+  reproducers/reproducing/0001/reproducer.php
 ```
 
 To reduce infinite-loop reproducers, bound each run with `--timeout`:
@@ -153,3 +153,6 @@ Sort by operation count instead of script line count:
 ```bash
 ./bin/reproducers --sort=ops
 ```
+
+Saved reproducers use short sequential directory names such as
+`reproducers/reproducing/0001` and `reproducers/non-reproducing/0002`.
