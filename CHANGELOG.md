@@ -26,4 +26,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bin/harness --timeout` now manages deadlines internally, reaps timed out children itself, and saves live `gdb` timeout backtraces into reproducer directories.
 ### Fixed
 - Normalized `bin/harness` reproducer paths in the live status display so project-local paths are shown relative to the current working directory.
+- Fixed `bin/harness` saved reproducer reports so core-dump crashes are labeled as core failures instead of `EXIT_0`.
 ### Internal

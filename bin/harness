@@ -2484,9 +2484,7 @@ while (true) {
 
         $signalLabel = $signal !== null ? signal_label($signal) : 'none';
         $signalDesc = $signal !== null ? signal_description($signal) : '';
-        $exitName = !empty($crashResult['timed_out'])
-            ? 'TIMEOUT'
-            : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
+        $exitName = build_failure_summary($crashResult);
 
         $reportData = [
             'command' => $finalCommand,
@@ -2704,9 +2702,7 @@ while (true) {
 
         $signalLabel = $signal !== null ? signal_label($signal) : 'none';
         $signalDesc = $signal !== null ? signal_description($signal) : '';
-        $exitName = !empty($leakResult['timed_out'])
-            ? 'TIMEOUT'
-            : ($signal !== null ? $signalLabel : "EXIT_{$exitCode}");
+        $exitName = build_failure_summary($leakResult);
 
         $reportData = [
             'command' => $finalCommand,
