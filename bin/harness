@@ -192,6 +192,40 @@ function resolve_existing_file(string $path): ?string
     return $real;
 }
 
+function display_path(string $path): string
+{
+    if ($path === '') {
+        return $path;
+    }
+
+    $resolved = realpath($path);
+    if ($resolved === false) {
+        $resolved = $path;
+    }
+
+    $cwd = getcwd();
+    if ($cwd === false) {
+        return $resolved;
+    }
+
+    $base = realpath($cwd);
+    if ($base === false) {
+        return $resolved;
+    }
+
+    $base = rtrim($base, DIRECTORY_SEPARATOR);
+    if ($resolved === $base) {
+        return '.';
+    }
+
+    $prefix = $base . DIRECTORY_SEPARATOR;
+    if (str_starts_with($resolved, $prefix)) {
+        return './' . substr($resolved, strlen($prefix));
+    }
+
+    return $resolved;
+}
+
 function copy_php_ini(string $jobDir, ?string $phpIni): ?string
 {
     if ($phpIni === null || $phpIni === '') {
@@ -564,7 +598,7 @@ function collect_recent_reproducers(array $roots, int $limit): array
                     'time' => $mtime,
                     'failure_type' => reproducer_failure_type($report, $rootType),
                     'reproducing' => $reproducing ? 'yes' : 'no',
-                    'path' => $dir,
+                    'path' => display_path($dir),
                 ];
             }
         }
@@ -669,7 +703,7 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         $gap,
         $leftWidth
     );
-    $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
+    $lastRepro = $stats['last_reproducer'] !== '' ? display_path((string) $stats['last_reproducer']) : 'n/a';
     $lines[] = truncate_text("Last reproducer: {$lastRepro}", $statusWidth);
     $command = $stats['last_command'] ?? '';
     $commandText = "Command: {$command}";
@@ -2498,7 +2532,7 @@ while (true) {
         if ($reproducerCrash) {
             $stats['reproducers_reproducing']++;
         }
-        $stats['last_event'] = "reproducer saved: {$finalJobDir}";
+        $stats['last_event'] = 'reproducer saved: ' . display_path($finalJobDir);
         $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
         maybe_render_screen(
@@ -2718,7 +2752,7 @@ while (true) {
             remove_dir_recursive((string) $leakJob['script_dir']);
         }
 
-        $stats['last_event'] = "leak saved: {$finalJobDir}";
+        $stats['last_event'] = 'leak saved: ' . display_path($finalJobDir);
         $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
         maybe_render_screen(
