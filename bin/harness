@@ -386,6 +386,38 @@ function format_duration(int $seconds): string
     return sprintf('%02d:%02d:%02d', $hours, $minutes, $seconds);
 }
 
+function format_age(int $timestamp, ?int $now = null): string
+{
+    $seconds = max(0, ($now ?? time()) - $timestamp);
+    if ($seconds === 0) {
+        return 'now';
+    }
+
+    $units = [
+        'd' => 86400,
+        'h' => 3600,
+        'm' => 60,
+        's' => 1,
+    ];
+    $parts = [];
+
+    foreach ($units as $label => $unitSeconds) {
+        $value = intdiv($seconds, $unitSeconds);
+        if ($value === 0) {
+            continue;
+        }
+
+        $parts[] = "{$value}{$label}";
+        $seconds -= $value * $unitSeconds;
+
+        if (count($parts) === 2) {
+            break;
+        }
+    }
+
+    return implode('', $parts);
+}
+
 function format_bytes(int $bytes): string
 {
     $units = ['B', 'K', 'M', 'G', 'T'];
@@ -706,9 +738,10 @@ function collect_recent_reproducers(array $roots, int $limit): array
 function render_recent_reproducers_table(array $entries): TableWidget
 {
     $rows = [];
+    $now = time();
     foreach ($entries as $entry) {
         $rows[] = TableRow::fromStrings(
-            date('m-d H:i:s', (int) $entry['time']),
+            format_age((int) $entry['time'], $now),
             (string) $entry['failure_type'],
             (string) $entry['reproducing'],
             (string) $entry['path'],
@@ -720,9 +753,9 @@ function render_recent_reproducers_table(array $entries): TableWidget
     }
 
     return TableWidget::default()
-        ->header(TableRow::fromStrings('Time', 'Failure', 'Repro', 'Path'))
+        ->header(TableRow::fromStrings('Age', 'Failure', 'Repro', 'Path'))
         ->widths(
-            Constraint::length(11),
+            Constraint::length(7),
             Constraint::length(16),
             Constraint::length(6),
             Constraint::min(20),
@@ -804,14 +837,15 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
 
     if ($display === null) {
         $recent = collect_recent_reproducers($stats['recent_reproducer_roots'] ?? [], RECENT_REPRODUCER_LIMIT);
+        $now = time();
         $lines[] = str_repeat('-', $width);
         $lines[] = pad_line($commandText, $width);
         $lines[] = str_repeat('-', $width);
         $lines[] = pad_line('Recent reproducers', $width);
         foreach ($recent as $entry) {
             $lines[] = pad_line(sprintf(
-                '%s  %-16s  %-3s  %s',
-                date('m-d H:i:s', (int) $entry['time']),
+                '%-7s  %-16s  %-3s  %s',
+                format_age((int) $entry['time'], $now),
                 (string) $entry['failure_type'],
                 (string) $entry['reproducing'],
                 (string) $entry['path']
