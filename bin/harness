@@ -554,7 +554,7 @@ function read_reproducer_report(string $dir): array
     return is_array($data) ? $data : [];
 }
 
-function reproducer_failure_type(array $report, string $bucket): string
+function reproducer_failure_type(array $report, string $bucket, string $dir): string
 {
     if (isset($report['leak_count']) && is_numeric($report['leak_count'])) {
         return 'LEAKS:' . (string) $report['leak_count'];
@@ -564,15 +564,90 @@ function reproducer_failure_type(array $report, string $bucket): string
         return 'VALGRIND:' . (string) $report['valgrind_errors'];
     }
 
+    $gdbErrorType = extract_gdb_error_type($dir);
+    if ($gdbErrorType !== null) {
+        return $gdbErrorType;
+    }
+
+    if (isset($report['exit_type']) && is_string($report['exit_type']) && $report['exit_type'] !== '') {
+        return $report['exit_type'];
+    }
+
     if (isset($report['exit_name']) && is_string($report['exit_name']) && $report['exit_name'] !== '') {
-        return $report['exit_name'];
+        return normalize_failure_label($report['exit_name']);
     }
 
     if (isset($report['signal']) && is_string($report['signal']) && $report['signal'] !== '' && $report['signal'] !== 'none') {
-        return $report['signal'];
+        return signal_error_type($report['signal']);
     }
 
     return $bucket === 'leaks' ? 'LEAK' : 'UNKNOWN';
+}
+
+function normalize_failure_label(string $label): string
+{
+    if (preg_match('/^core(?:\s|$)/i', $label) === 1) {
+        return 'core';
+    }
+
+    return $label;
+}
+
+function signal_error_type(string $signal): string
+{
+    return match (strtoupper($signal)) {
+        'SIGSEGV' => 'SEGFAULT',
+        'SIGBUS' => 'BUS_ERROR',
+        'SIGILL' => 'ILLEGAL_INSTRUCTION',
+        'SIGABRT' => 'ABORT',
+        'SIGFPE' => 'FLOATING_POINT_EXCEPTION',
+        'SIGTRAP' => 'TRAP',
+        default => $signal,
+    };
+}
+
+function extract_gdb_error_type(string $dir): ?string
+{
+    foreach (gdb_backtrace_paths($dir) as $path) {
+        $lines = @file($path, FILE_IGNORE_NEW_LINES);
+        if ($lines === false) {
+            continue;
+        }
+
+        foreach ($lines as $line) {
+            if (preg_match('/\b(?:Program terminated with|Program received|Thread \d+ .* received) signal (SIG[A-Z0-9]+)/', $line, $matches) === 1) {
+                return signal_error_type($matches[1]);
+            }
+        }
+    }
+
+    return null;
+}
+
+/** @return list<string> */
+function gdb_backtrace_paths(string $dir): array
+{
+    $entries = scandir($dir);
+    if ($entries === false) {
+        return [];
+    }
+
+    $paths = [];
+    foreach ($entries as $entry) {
+        if (preg_match('/^gdb-(?:timeout-)?backtrace(?:-simple)?(?:-.+)?\.txt$/', $entry) !== 1) {
+            continue;
+        }
+        $paths[] = $dir . '/' . $entry;
+    }
+
+    usort($paths, static function (string $a, string $b): int {
+        $aSimple = str_contains(basename($a), 'simple') ? 0 : 1;
+        $bSimple = str_contains(basename($b), 'simple') ? 0 : 1;
+
+        return ($aSimple <=> $bSimple) ?: strcmp($a, $b);
+    });
+
+    return $paths;
 }
 
 function collect_recent_reproducers(array $roots, int $limit): array
@@ -615,7 +690,7 @@ function collect_recent_reproducers(array $roots, int $limit): array
 
                 $entries[] = [
                     'time' => $mtime,
-                    'failure_type' => reproducer_failure_type($report, $rootType),
+                    'failure_type' => reproducer_failure_type($report, $rootType, $dir),
                     'reproducing' => $reproducing ? 'yes' : 'no',
                     'path' => display_path($dir),
                 ];
@@ -1908,8 +1983,7 @@ function build_failure_summary(array $result): string
     }
 
     if (!empty($result['core_files'])) {
-        $core = basename($result['core_files'][0]);
-        return "core {$core}";
+        return 'core';
     }
 
     if ($result['signal'] !== null) {
@@ -2478,6 +2552,9 @@ while (true) {
             );
         }
 
+        $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
+        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
+
         $signal = $crashResult['signal'];
         $exitCode = $crashResult['exit_code'];
         $pid = $crashResult['pid'];
@@ -2485,11 +2562,13 @@ while (true) {
         $signalLabel = $signal !== null ? signal_label($signal) : 'none';
         $signalDesc = $signal !== null ? signal_description($signal) : '';
         $exitName = build_failure_summary($crashResult);
+        $exitType = extract_gdb_error_type($jobDir) ?? normalize_failure_label($exitName);
 
         $reportData = [
             'command' => $finalCommand,
             'exit_code' => $exitCode,
             'exit_name' => $exitName,
+            'exit_type' => $exitType,
             'signal' => $signalLabel,
         ];
         if ($finalOps !== null) {
@@ -2536,9 +2615,6 @@ while (true) {
             $jobDir . '/report.json',
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
-        $movedCores = move_core_dumps($crashResult['core_files'], $jobDir);
-        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
-
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerCrash = false;
         if (is_file($reproducerScript)) {
@@ -2695,6 +2771,9 @@ while (true) {
             );
         }
 
+        $movedCores = move_core_dumps($leakResult['core_files'], $jobDir);
+        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
+
         $signal = $leakResult['signal'];
         $exitCode = $leakResult['exit_code'];
         $pid = $leakResult['pid'];
@@ -2703,11 +2782,13 @@ while (true) {
         $signalLabel = $signal !== null ? signal_label($signal) : 'none';
         $signalDesc = $signal !== null ? signal_description($signal) : '';
         $exitName = build_failure_summary($leakResult);
+        $exitType = extract_gdb_error_type($jobDir) ?? normalize_failure_label($exitName);
 
         $reportData = [
             'command' => $finalCommand,
             'exit_code' => $exitCode,
             'exit_name' => $exitName,
+            'exit_type' => $exitType,
             'signal' => $signalLabel,
         ];
         if ($finalOps !== null) {
@@ -2757,9 +2838,6 @@ while (true) {
             $jobDir . '/report.json',
             json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
-        $movedCores = move_core_dumps($leakResult['core_files'], $jobDir);
-        generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
-
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerLeak = false;
         if (is_file($reproducerScript)) {

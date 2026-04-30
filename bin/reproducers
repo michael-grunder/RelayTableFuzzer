@@ -259,12 +259,109 @@ function build_row(string $name, string $dir, string $status): array
         'mtime' => filemtime($dir) ?: 0,
         'line_count' => count_reproducer_lines($dir),
         'ops' => $report['ops'] ?? null,
-        'exit_name' => $report['exit_name'] ?? '',
+        'exit_name' => report_failure_type($report, $dir),
         'timed_out' => !empty($report['timed_out']),
         'command' => $report['command'] ?? '',
         'core_files' => $report['core_files'] ?? [],
         'output_files' => $report['output_files'] ?? [],
     ];
+}
+
+/** @param array<string, mixed> $report */
+function report_failure_type(array $report, string $dir): string
+{
+    if (isset($report['leak_count']) && is_numeric($report['leak_count'])) {
+        return 'LEAKS:' . (string) $report['leak_count'];
+    }
+
+    if (isset($report['valgrind_errors']) && is_numeric($report['valgrind_errors']) && (int) $report['valgrind_errors'] > 0) {
+        return 'VALGRIND:' . (string) $report['valgrind_errors'];
+    }
+
+    $gdbErrorType = extract_gdb_error_type($dir);
+    if ($gdbErrorType !== null) {
+        return $gdbErrorType;
+    }
+
+    if (isset($report['exit_type']) && is_string($report['exit_type']) && $report['exit_type'] !== '') {
+        return $report['exit_type'];
+    }
+
+    if (isset($report['exit_name']) && is_string($report['exit_name']) && $report['exit_name'] !== '') {
+        return normalize_failure_label($report['exit_name']);
+    }
+
+    if (isset($report['signal']) && is_string($report['signal']) && $report['signal'] !== '' && $report['signal'] !== 'none') {
+        return signal_error_type($report['signal']);
+    }
+
+    return '';
+}
+
+function normalize_failure_label(string $label): string
+{
+    if (preg_match('/^core(?:\s|$)/i', $label) === 1) {
+        return 'core';
+    }
+
+    return $label;
+}
+
+function signal_error_type(string $signal): string
+{
+    return match (strtoupper($signal)) {
+        'SIGSEGV' => 'SEGFAULT',
+        'SIGBUS' => 'BUS_ERROR',
+        'SIGILL' => 'ILLEGAL_INSTRUCTION',
+        'SIGABRT' => 'ABORT',
+        'SIGFPE' => 'FLOATING_POINT_EXCEPTION',
+        'SIGTRAP' => 'TRAP',
+        default => $signal,
+    };
+}
+
+function extract_gdb_error_type(string $dir): ?string
+{
+    foreach (gdb_backtrace_paths($dir) as $path) {
+        $lines = @file($path, FILE_IGNORE_NEW_LINES);
+        if ($lines === false) {
+            continue;
+        }
+
+        foreach ($lines as $line) {
+            if (preg_match('/\b(?:Program terminated with|Program received|Thread \d+ .* received) signal (SIG[A-Z0-9]+)/', $line, $matches) === 1) {
+                return signal_error_type($matches[1]);
+            }
+        }
+    }
+
+    return null;
+}
+
+/** @return list<string> */
+function gdb_backtrace_paths(string $dir): array
+{
+    $entries = scandir($dir);
+    if ($entries === false) {
+        return [];
+    }
+
+    $paths = [];
+    foreach ($entries as $entry) {
+        if (preg_match('/^gdb-(?:timeout-)?backtrace(?:-simple)?(?:-.+)?\.txt$/', $entry) !== 1) {
+            continue;
+        }
+        $paths[] = $dir . '/' . $entry;
+    }
+
+    usort($paths, static function (string $a, string $b): int {
+        $aSimple = str_contains(basename($a), 'simple') ? 0 : 1;
+        $bSimple = str_contains(basename($b), 'simple') ? 0 : 1;
+
+        return ($aSimple <=> $bSimple) ?: strcmp($a, $b);
+    });
+
+    return $paths;
 }
 
 function count_reproducer_lines(string $dir): int
