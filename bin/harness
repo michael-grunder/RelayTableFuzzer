@@ -613,9 +613,8 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         ? format_duration((int)($now - $stats['last_failure_time']))
         : 'never';
 
+    $statusWidth = max(1, $width - 2);
     $lines = [];
-    $title = 'relay-table-fuzzer harness';
-    $lines[] = pad_line($title, $width);
     $activeJobs = $stats['active_jobs'] ?? 1;
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
     $reproducersTotal = $stats['reproducers'] ?? 0;
@@ -646,12 +645,12 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         $maxRight = max($maxRight, strlen($right));
     }
     $gap = 3;
-    $leftWidth = min($maxLeft, max(1, $width - $gap - 1));
-    if ($maxRight > 0 && $leftWidth + $gap + $maxRight > $width) {
-        $leftWidth = max(1, $width - $gap - $maxRight);
+    $leftWidth = min($maxLeft, max(1, $statusWidth - $gap - 1));
+    if ($maxRight > 0 && $leftWidth + $gap + $maxRight > $statusWidth) {
+        $leftWidth = max(1, $statusWidth - $gap - $maxRight);
     }
     foreach ($pairs as [$left, $right]) {
-        $lines[] = two_column($left, $right, $width, $gap, $leftWidth);
+        $lines[] = two_column($left, $right, $statusWidth, $gap, $leftWidth);
     }
     $memoryLine = 'Relay mem: n/a';
     $relayMemory = $stats['relay_memory'] ?? null;
@@ -660,18 +659,18 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         $total = format_bytes((int)($relayMemory['total'] ?? 0));
         $memoryLine = "Relay mem: {$used}/{$total}";
     }
-    $lines[] = pad_line($memoryLine, $width);
+    $lines[] = $memoryLine;
     $lastFailure = $stats['last_failure_summary'] !== '' ? $stats['last_failure_summary'] : 'none';
     $event = $stats['last_event'] !== '' ? $stats['last_event'] : 'none';
     $lines[] = two_column(
         format_label_value('Last crash', $lastFailure),
         format_label_value('Event', $event),
-        $width,
+        $statusWidth,
         $gap,
         $leftWidth
     );
     $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
-    $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
+    $lines[] = truncate_text("Last reproducer: {$lastRepro}", $statusWidth);
     $command = $stats['last_command'] ?? '';
     $commandText = "Command: {$command}";
 
@@ -696,7 +695,9 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         return;
     }
 
-    $recentLimit = max(1, min(RECENT_REPRODUCER_LIMIT, $height - 10));
+    $statusHeight = count($lines) + 2;
+    $commandHeight = 3;
+    $recentLimit = max(1, min(RECENT_REPRODUCER_LIMIT, $height - $statusHeight - $commandHeight - 2));
     $recent = collect_recent_reproducers($stats['recent_reproducer_roots'] ?? [], $recentLimit);
     $summary = harness_block(
         'Status',
@@ -715,8 +716,8 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         GridWidget::default()
             ->direction(Direction::Vertical)
             ->constraints(
-                Constraint::length(11),
-                Constraint::length(3),
+                Constraint::length($statusHeight),
+                Constraint::length($commandHeight),
                 Constraint::min(5),
             )
             ->widgets($summary, $commandBlock, $recentBlock)

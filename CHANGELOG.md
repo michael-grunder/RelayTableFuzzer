@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `-v`/`-vv` verbosity controls to `bin/final-reduce-script` for richer runtime progress and retry diagnostics.
 - Added `--progress-mode=screen` and `--interval` to `bin/final-reduce-script` for a periodically refreshed live status screen showing elapsed time, iteration counter, and best-so-far script/command details.
 ### Changed
+- Tightened the `bin/harness` live status panel so it no longer renders spacer rows between summary lines.
 - Reworked `bin/harness` screen drawing to use `php-tui/php-tui` and added a bottom table of recent reproducers with failure type, reproduction status, and path.
 - `run-reproducer.sh` now uses absolute paths and copies the active php.ini into the reproducer directory.
 - `run-reproducer.sh` now resolves the script directory at runtime for reproducer-local paths.
