@@ -3,6 +3,23 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use PhpTui\Tui\Color\AnsiColor;
+use PhpTui\Tui\Display\Display;
+use PhpTui\Tui\DisplayBuilder;
+use PhpTui\Tui\Extension\Core\Widget\BlockWidget;
+use PhpTui\Tui\Extension\Core\Widget\GridWidget;
+use PhpTui\Tui\Extension\Core\Widget\ParagraphWidget;
+use PhpTui\Tui\Extension\Core\Widget\Table\TableRow;
+use PhpTui\Tui\Extension\Core\Widget\TableWidget;
+use PhpTui\Tui\Layout\Constraint;
+use PhpTui\Tui\Style\Modifier;
+use PhpTui\Tui\Style\Style;
+use PhpTui\Tui\Text\Title;
+use PhpTui\Tui\Widget\Borders;
+use PhpTui\Tui\Widget\Direction;
+
 const CRASH_SIGNALS = [
     SIGSEGV,
     SIGBUS,
@@ -22,6 +39,7 @@ const SIGNAL_LABELS = [
 ];
 
 const VALGRIND_ERROR_EXIT_CODE = 99;
+const RECENT_REPRODUCER_LIMIT = 8;
 
 function usage(string $script): string
 {
@@ -437,9 +455,158 @@ function count_reproducer_dirs(string $reproducersDir): array
     return ['total' => $total, 'reproducing' => $reproducing];
 }
 
+function create_tui_display(): ?Display
+{
+    static $display = null;
+    static $initialized = false;
+
+    if ($initialized) {
+        return $display;
+    }
+
+    $initialized = true;
+    try {
+        $display = DisplayBuilder::default()->fullscreen()->build();
+        $display->clear();
+    } catch (Throwable) {
+        $display = null;
+    }
+
+    return $display;
+}
+
+function harness_block(string $title, \PhpTui\Tui\Widget\Widget $widget): BlockWidget
+{
+    return BlockWidget::default()
+        ->borders(Borders::ALL)
+        ->titles(Title::fromString($title))
+        ->borderStyle(Style::default()->fg(AnsiColor::DarkGray))
+        ->titleStyle(Style::default()->fg(AnsiColor::LightCyan)->addModifier(Modifier::BOLD))
+        ->widget($widget);
+}
+
+function read_reproducer_report(string $dir): array
+{
+    $path = $dir . '/report.json';
+    if (!is_file($path)) {
+        return [];
+    }
+
+    $json = file_get_contents($path);
+    if (!is_string($json)) {
+        return [];
+    }
+
+    $data = json_decode($json, true);
+    return is_array($data) ? $data : [];
+}
+
+function reproducer_failure_type(array $report, string $bucket): string
+{
+    if (isset($report['leak_count']) && is_numeric($report['leak_count'])) {
+        return 'LEAKS:' . (string) $report['leak_count'];
+    }
+
+    if (isset($report['valgrind_errors']) && is_numeric($report['valgrind_errors']) && (int) $report['valgrind_errors'] > 0) {
+        return 'VALGRIND:' . (string) $report['valgrind_errors'];
+    }
+
+    if (isset($report['exit_name']) && is_string($report['exit_name']) && $report['exit_name'] !== '') {
+        return $report['exit_name'];
+    }
+
+    if (isset($report['signal']) && is_string($report['signal']) && $report['signal'] !== '' && $report['signal'] !== 'none') {
+        return $report['signal'];
+    }
+
+    return $bucket === 'leaks' ? 'LEAK' : 'UNKNOWN';
+}
+
+function collect_recent_reproducers(array $roots, int $limit): array
+{
+    $entries = [];
+
+    foreach ($roots as $root) {
+        if (!is_string($root) || $root === '' || !is_dir($root)) {
+            continue;
+        }
+
+        $rootType = basename($root) === 'leaks' ? 'leaks' : 'reproducers';
+        foreach ([true => 'reproducing', false => 'non-reproducing'] as $reproducing => $bucket) {
+            $bucketDir = $root . '/' . $bucket;
+            if (!is_dir($bucketDir)) {
+                continue;
+            }
+
+            $children = scandir($bucketDir);
+            if ($children === false) {
+                continue;
+            }
+
+            foreach ($children as $child) {
+                if ($child === '.' || $child === '..') {
+                    continue;
+                }
+
+                $dir = $bucketDir . '/' . $child;
+                if (!is_dir($dir)) {
+                    continue;
+                }
+
+                $report = read_reproducer_report($dir);
+                $reportPath = $dir . '/report.json';
+                $mtime = max(
+                    filemtime($dir) ?: 0,
+                    is_file($reportPath) ? (filemtime($reportPath) ?: 0) : 0
+                );
+
+                $entries[] = [
+                    'time' => $mtime,
+                    'failure_type' => reproducer_failure_type($report, $rootType),
+                    'reproducing' => $reproducing ? 'yes' : 'no',
+                    'path' => $dir,
+                ];
+            }
+        }
+    }
+
+    usort($entries, static fn (array $a, array $b): int => ($b['time'] <=> $a['time']) ?: strcmp((string) $b['path'], (string) $a['path']));
+
+    return array_slice($entries, 0, $limit);
+}
+
+function render_recent_reproducers_table(array $entries): TableWidget
+{
+    $rows = [];
+    foreach ($entries as $entry) {
+        $rows[] = TableRow::fromStrings(
+            date('m-d H:i:s', (int) $entry['time']),
+            (string) $entry['failure_type'],
+            (string) $entry['reproducing'],
+            (string) $entry['path'],
+        );
+    }
+
+    if ($rows === []) {
+        $rows[] = TableRow::fromStrings('-', 'none', '-', 'no reproducers saved yet');
+    }
+
+    return TableWidget::default()
+        ->header(TableRow::fromStrings('Time', 'Failure', 'Repro', 'Path'))
+        ->widths(
+            Constraint::length(11),
+            Constraint::length(16),
+            Constraint::length(6),
+            Constraint::min(20),
+        )
+        ->rows(...$rows);
+}
+
 function render_screen(array $stats, ?int $currentOps, string $mode): void
 {
-    $width = terminal_width();
+    $display = create_tui_display();
+    $width = $display !== null ? max(60, $display->viewportArea()->width) : terminal_width();
+    $height = $display !== null ? max(12, $display->viewportArea()->height) : 24;
     $now = microtime(true);
     $elapsed = format_duration((int)($now - $stats['start_time']));
     $sinceFailure = $stats['last_failure_time'] !== null
@@ -447,10 +614,8 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
         : 'never';
 
     $lines = [];
-    $lines[] = str_repeat('=', $width);
     $title = 'relay-table-fuzzer harness';
-    $lines[] = pad_line(str_pad($title, $width, ' ', STR_PAD_BOTH), $width);
-    $lines[] = str_repeat('-', $width);
+    $lines[] = pad_line($title, $width);
     $activeJobs = $stats['active_jobs'] ?? 1;
     $opsLabel = $currentOps !== null ? (string)$currentOps : 'n/a';
     $reproducersTotal = $stats['reproducers'] ?? 0;
@@ -507,13 +672,55 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     );
     $lastRepro = $stats['last_reproducer'] !== '' ? $stats['last_reproducer'] : 'n/a';
     $lines[] = pad_line("Last reproducer: {$lastRepro}", $width);
-    $lines[] = str_repeat('-', $width);
     $command = $stats['last_command'] ?? '';
-    $lines[] = pad_line("Command: {$command}", $width);
-    $lines[] = str_repeat('=', $width);
+    $commandText = "Command: {$command}";
 
-    fwrite(STDOUT, "\033[2J\033[H" . implode("\n", $lines) . "\n");
-    fflush(STDOUT);
+    if ($display === null) {
+        $recent = collect_recent_reproducers($stats['recent_reproducer_roots'] ?? [], RECENT_REPRODUCER_LIMIT);
+        $lines[] = str_repeat('-', $width);
+        $lines[] = pad_line($commandText, $width);
+        $lines[] = str_repeat('-', $width);
+        $lines[] = pad_line('Recent reproducers', $width);
+        foreach ($recent as $entry) {
+            $lines[] = pad_line(sprintf(
+                '%s  %-16s  %-3s  %s',
+                date('m-d H:i:s', (int) $entry['time']),
+                (string) $entry['failure_type'],
+                (string) $entry['reproducing'],
+                (string) $entry['path']
+            ), $width);
+        }
+        $lines[] = str_repeat('=', $width);
+        fwrite(STDOUT, "\033[2J\033[H" . implode("\n", $lines) . "\n");
+        fflush(STDOUT);
+        return;
+    }
+
+    $recentLimit = max(1, min(RECENT_REPRODUCER_LIMIT, $height - 10));
+    $recent = collect_recent_reproducers($stats['recent_reproducer_roots'] ?? [], $recentLimit);
+    $summary = harness_block(
+        'Status',
+        ParagraphWidget::fromString(implode("\n", $lines))
+    );
+    $commandBlock = harness_block(
+        'Command',
+        ParagraphWidget::fromString($commandText)
+    );
+    $recentBlock = harness_block(
+        'Recent reproducers',
+        render_recent_reproducers_table($recent)
+    );
+
+    $display->draw(
+        GridWidget::default()
+            ->direction(Direction::Vertical)
+            ->constraints(
+                Constraint::length(11),
+                Constraint::length(3),
+                Constraint::min(5),
+            )
+            ->widgets($summary, $commandBlock, $recentBlock)
+    );
 }
 
 function maybe_render_screen(
@@ -1897,6 +2104,7 @@ $stats = [
     'last_reproducer' => '',
     'active_jobs' => 0,
     'relay_memory' => null,
+    'recent_reproducer_roots' => [$reproducersDir, $leaksDir],
 ];
 
 $jobCounter = 0;
