@@ -2058,6 +2058,16 @@ function cleanup_output_files(array $result): void
     }
 }
 
+function cleanup_discarded_job(array $result, array $job): void
+{
+    cleanup_output_files($result);
+
+    $scriptDir = $job['script_dir'] ?? null;
+    if (is_string($scriptDir) && $scriptDir !== '') {
+        remove_dir_recursive($scriptDir);
+    }
+}
+
 function move_output_files(array $result, string $destinationDir): array
 {
     $moved = [];
@@ -2729,10 +2739,7 @@ while (true) {
         $stats['last_event'] = "job {$jobId} finished";
 
         if ($job['cancelled']) {
-            cleanup_output_files($result);
-            if ($harnessMode === 'script' && isset($job['script_dir'])) {
-                remove_dir_recursive((string) $job['script_dir']);
-            }
+            cleanup_discarded_job($result, $job);
             continue;
         }
 
@@ -2777,10 +2784,7 @@ while (true) {
                 cancel_command($pendingJob);
             }
         } else {
-            cleanup_output_files($result);
-            if ($harnessMode === 'script' && isset($job['script_dir'])) {
-                remove_dir_recursive((string) $job['script_dir']);
-            }
+            cleanup_discarded_job($result, $job);
         }
 
         $stats['active_jobs'] = count($runningJobs);
