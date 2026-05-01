@@ -40,12 +40,20 @@ const SIGNAL_LABELS = [
 
 const VALGRIND_ERROR_EXIT_CODE = 99;
 const RECENT_REPRODUCER_LIMIT = 8;
+const REPRODUCER_BUCKET_REPRODUCING = 'reproducing';
+const REPRODUCER_BUCKET_NON_REPRODUCING = 'non-reproducing';
+const REPRODUCER_BUCKET_REPRODUCABLE = 'reproducable';
+const REPRODUCER_BUCKETS = [
+    REPRODUCER_BUCKET_REPRODUCABLE,
+    REPRODUCER_BUCKET_REPRODUCING,
+    REPRODUCER_BUCKET_NON_REPRODUCING,
+];
 
 function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--valgrind[=PATH]] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] [--repro-tries N] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--valgrind[=PATH]] [--rr] [--rr-chaos-mode] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] [--repro-tries N] -- <command...>
 
 Dynamic replacements in command arguments and -d values:
   {range}            -> random integer
@@ -55,12 +63,24 @@ Dynamic replacements in command arguments and -d values:
 
 Notes:
   --valgrind is only supported with --mode=script.
+  --rr records each run with rr record; --rr-chaos-mode also passes -h to rr.
+  --rr and --valgrind are mutually exclusive.
 USAGE;
 }
 
 function render_command(array $command): string
 {
     return implode(' ', array_map('escapeshellarg', $command));
+}
+
+function render_exec_command(array $command, ?string $rrTraceDir): string
+{
+    $rendered = render_command($command);
+    if ($rrTraceDir === null || $rrTraceDir === '') {
+        return $rendered;
+    }
+
+    return '_RR_TRACE_DIR=' . escapeshellarg($rrTraceDir) . ' ' . $rendered;
 }
 
 function signal_label(int $signal): string
@@ -159,6 +179,16 @@ function build_valgrind_command(string $valgrindBin, string $logPath, array $com
     );
 }
 
+function build_rr_command(string $rrBin, bool $rrChaosMode, array $command): array
+{
+    $rrCommand = [$rrBin, 'record'];
+    if ($rrChaosMode) {
+        $rrCommand[] = '-h';
+    }
+
+    return array_merge($rrCommand, $command);
+}
+
 function create_temp_log(string $prefix): ?string
 {
     $path = tempnam(sys_get_temp_dir(), $prefix);
@@ -168,14 +198,34 @@ function create_temp_log(string $prefix): ?string
 function build_exec_command(
     array $command,
     ?string $valgrindBin,
-    ?string $valgrindLogPath
+    ?string $valgrindLogPath,
+    ?string $rrBin = null,
+    bool $rrChaosMode = false
 ): array {
     $exec = $command;
     if ($valgrindBin !== null && $valgrindLogPath !== null) {
         $exec = build_valgrind_command($valgrindBin, $valgrindLogPath, $exec);
     }
+    if ($rrBin !== null) {
+        $exec = build_rr_command($rrBin, $rrChaosMode, $exec);
+    }
 
     return $exec;
+}
+
+function build_process_env(?string $rrTraceDir): ?array
+{
+    if ($rrTraceDir === null || $rrTraceDir === '') {
+        return null;
+    }
+
+    $env = getenv();
+    if (!is_array($env)) {
+        $env = [];
+    }
+    $env['_RR_TRACE_DIR'] = $rrTraceDir;
+
+    return $env;
 }
 
 function resolve_executable_path(string $binary): string
@@ -283,7 +333,9 @@ function write_run_reproducer(
     string $phpBin,
     ?string $phpIni,
     array $phpArgs,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
 ): void {
     $runnerPhpBin = resolve_executable_path($phpBin);
     $runnerPhpIni = copy_php_ini($jobDir, $phpIni);
@@ -305,7 +357,7 @@ function write_run_reproducer(
         $phpIniArg = '"$PHP_INI"';
     }
     $phpArgsRendered = array_map('escapeshellarg', $phpArgs);
-    $runnerCommand = array_filter(array_merge(
+    $baseCommand = array_filter(array_merge(
         $valgrindBin !== null
             ? [
                 '"$VALGRIND_BIN"',
@@ -319,6 +371,14 @@ function write_run_reproducer(
         $phpArgsRendered,
         ['"$SCRIPT_DIR/reproducer.php"']
     ), static fn (string $arg): bool => $arg !== '');
+    $runnerCommand = $baseCommand;
+    if ($rrBin !== null) {
+        $runnerCommand = array_merge(
+            ['"$RR_BIN"', 'record'],
+            $rrChaosMode ? ['-h'] : [],
+            $baseCommand
+        );
+    }
     $runnerLines = [
         '#!/usr/bin/env sh',
         '',
@@ -326,6 +386,11 @@ function write_run_reproducer(
         'SCRIPT_DIR=$(dirname "$(readlink -f "$0")")',
         'PHP_BIN=' . escapeshellarg($runnerPhpBin),
     ];
+    if ($rrBin !== null) {
+        $runnerLines[] = 'RR_BIN=' . escapeshellarg($rrBin);
+        $runnerLines[] = 'RR_TRACE_DIR="$SCRIPT_DIR/rr-reproducer-trace"';
+        $runnerLines[] = 'mkdir -p "$RR_TRACE_DIR"';
+    }
     if ($valgrindBin !== null) {
         $runnerLines[] = 'VALGRIND_BIN=' . escapeshellarg($valgrindBin);
         $runnerLines[] = 'VALGRIND_LOG="$SCRIPT_DIR/valgrind.log"';
@@ -335,7 +400,7 @@ function write_run_reproducer(
     if ($phpIniLine !== null) {
         $runnerLines[] = $phpIniLine;
     }
-    $runnerLines[] = 'exec ' . implode(' ', $runnerCommand);
+    $runnerLines[] = ($rrBin !== null ? '_RR_TRACE_DIR="$RR_TRACE_DIR" ' : '') . 'exec ' . implode(' ', $runnerCommand);
     file_put_contents($runnerPath, implode("\n", $runnerLines) . "\n");
     @chmod($runnerPath, 0755);
 
@@ -408,6 +473,10 @@ function create_reproducer_work_dir(string $storageDir): string
 
 function remove_dir_recursive(string $dir): void
 {
+    if (is_link($dir)) {
+        @unlink($dir);
+        return;
+    }
     if (!is_dir($dir)) {
         return;
     }
@@ -420,13 +489,45 @@ function remove_dir_recursive(string $dir): void
             continue;
         }
         $path = $dir . '/' . $entry;
-        if (is_dir($path)) {
+        if (is_dir($path) && !is_link($path)) {
             remove_dir_recursive($path);
             continue;
         }
         @unlink($path);
     }
     @rmdir($dir);
+}
+
+function copy_path_recursive(string $source, string $target): bool
+{
+    if (is_link($source)) {
+        $linkTarget = readlink($source);
+        return $linkTarget !== false && @symlink($linkTarget, $target);
+    }
+
+    if (!is_dir($source)) {
+        return @copy($source, $target);
+    }
+
+    if (!is_dir($target) && !@mkdir($target, 0777, true) && !is_dir($target)) {
+        return false;
+    }
+
+    $entries = scandir($source);
+    if ($entries === false) {
+        return false;
+    }
+
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        if (!copy_path_recursive($source . '/' . $entry, $target . '/' . $entry)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 function format_duration(int $seconds): string
@@ -574,7 +675,7 @@ function count_reproducer_dirs(string $reproducersDir): array
         if (!is_dir($dir)) {
             continue;
         }
-        if ($entry === 'reproducing' || $entry === 'non-reproducing') {
+        if (in_array($entry, REPRODUCER_BUCKETS, true)) {
             $subEntries = scandir($dir);
             if ($subEntries === false) {
                 continue;
@@ -587,7 +688,7 @@ function count_reproducer_dirs(string $reproducersDir): array
                     continue;
                 }
                 $total++;
-                if ($entry === 'reproducing') {
+                if ($entry === REPRODUCER_BUCKET_REPRODUCING || $entry === REPRODUCER_BUCKET_REPRODUCABLE) {
                     $reproducing++;
                 }
             }
@@ -751,7 +852,11 @@ function collect_recent_reproducers(array $roots, int $limit): array
         }
 
         $rootType = basename($root) === 'leaks' ? 'leaks' : 'reproducers';
-        foreach ([true => 'reproducing', false => 'non-reproducing'] as $reproducing => $bucket) {
+        foreach ([
+            REPRODUCER_BUCKET_REPRODUCABLE => true,
+            REPRODUCER_BUCKET_REPRODUCING => true,
+            REPRODUCER_BUCKET_NON_REPRODUCING => false,
+        ] as $bucket => $reproducing) {
             $bucketDir = $root . '/' . $bucket;
             if (!is_dir($bucketDir)) {
                 continue;
@@ -1017,7 +1122,9 @@ function run_command(
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
     bool $onlyCrashes,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin = null,
+    bool $rrChaosMode = false
 ): array {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
@@ -1032,9 +1139,13 @@ function run_command(
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath);
-    $process = proc_open($execCommand, $descriptorSpec, $pipes);
+    $rrTraceDir = $rrBin !== null ? create_temp_dir('relay-harness-rr-') : null;
+    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath, $rrBin, $rrChaosMode);
+    $process = proc_open($execCommand, $descriptorSpec, $pipes, null, build_process_env($rrTraceDir));
     if (!is_resource($process)) {
+        if ($rrTraceDir !== null) {
+            remove_dir_recursive($rrTraceDir);
+        }
         fwrite(STDERR, "Failed to start process\n");
         exit(1);
     }
@@ -1112,6 +1223,8 @@ function run_command(
         'stderr_path' => $stderrPath !== false ? $stderrPath : null,
         'valgrind_log_path' => $valgrindLogPath,
         'valgrind_errors' => $valgrindErrors,
+        'rr_trace_dir' => $rrTraceDir,
+        'rr_chaos_mode' => $rrBin !== null ? $rrChaosMode : null,
         'timeout_backtrace_path' => $timeoutBacktracePath,
         'timeout_backtrace_simple_path' => $timeoutBacktraceSimplePath,
     ];
@@ -1123,7 +1236,9 @@ function start_command(
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin = null,
+    bool $rrChaosMode = false
 ): array {
     $stdoutPath = tempnam(sys_get_temp_dir(), 'relay-harness-out-');
     $stderrPath = tempnam(sys_get_temp_dir(), 'relay-harness-err-');
@@ -1138,9 +1253,13 @@ function start_command(
         2 => ['file', $stderrPath !== false ? $stderrPath : 'php://stderr', 'w'],
     ];
 
-    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath);
-    $process = proc_open($execCommand, $descriptorSpec, $pipes);
+    $rrTraceDir = $rrBin !== null ? create_temp_dir('relay-harness-rr-') : null;
+    $execCommand = build_exec_command($fullCommand, $valgrindBin, $valgrindLogPath, $rrBin, $rrChaosMode);
+    $process = proc_open($execCommand, $descriptorSpec, $pipes, null, build_process_env($rrTraceDir));
     if (!is_resource($process)) {
+        if ($rrTraceDir !== null) {
+            remove_dir_recursive($rrTraceDir);
+        }
         fwrite(STDERR, "Failed to start process\n");
         exit(1);
     }
@@ -1161,9 +1280,11 @@ function start_command(
         'timeout_signal' => $timeoutSignal,
         'timeout_signal_arg' => $timeoutSignalArg,
         'valgrind_log_path' => $valgrindLogPath,
+        'rr_trace_dir' => $rrTraceDir,
+        'rr_chaos_mode' => $rrBin !== null ? $rrChaosMode : null,
         'timeout_backtrace_path' => null,
         'timeout_backtrace_simple_path' => null,
-        'command_string' => render_command($execCommand),
+        'command_string' => render_exec_command($execCommand, $rrTraceDir),
     ];
 }
 
@@ -1211,6 +1332,8 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $
         'stderr_path' => $job['stderr_path'],
         'valgrind_log_path' => $job['valgrind_log_path'] ?? null,
         'valgrind_errors' => $valgrindErrors,
+        'rr_trace_dir' => $job['rr_trace_dir'] ?? null,
+        'rr_chaos_mode' => $job['rr_chaos_mode'] ?? null,
         'timeout_backtrace_path' => $job['timeout_backtrace_path'] ?? null,
         'timeout_backtrace_simple_path' => $job['timeout_backtrace_simple_path'] ?? null,
     ];
@@ -1286,20 +1409,22 @@ function create_job(
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
 ): array {
     $dynamicArgs = array_map('replace_dynamic', $commandArgs);
     $dynamicPhpArgs = array_map('replace_dynamic', $phpArgs);
     $runArgs = array_map(static fn(string $arg): string => apply_ops($arg, $currentOps), $dynamicArgs);
     $fullCommand = build_php_command($phpBin, $phpIni, $dynamicPhpArgs, $runArgs);
 
-    $job = start_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $valgrindBin);
+    $job = start_command($fullCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $valgrindBin, $rrBin, $rrChaosMode);
     $job['id'] = $jobId;
     $job['dynamic_args'] = $dynamicArgs;
     $job['php_args'] = $dynamicPhpArgs;
     $job['full_command'] = $fullCommand;
     $job['command_string'] = $job['command_string'] ?? render_command(
-        build_exec_command($fullCommand, $valgrindBin, $job['valgrind_log_path'] ?? null)
+        build_exec_command($fullCommand, $valgrindBin, $job['valgrind_log_path'] ?? null, $rrBin, $rrChaosMode)
     );
     $job['ops'] = $currentOps;
 
@@ -1372,7 +1497,9 @@ function capture_script_artifacts(
     string $phpBin,
     ?string $phpIni,
     array $phpArgs,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
 ): void
 {
     $files = [
@@ -1391,7 +1518,7 @@ function capture_script_artifacts(
         @copy($source, $dest);
     }
 
-    write_run_reproducer($destinationDir, $phpBin, $phpIni, $phpArgs, $valgrindBin);
+    write_run_reproducer($destinationDir, $phpBin, $phpIni, $phpArgs, $valgrindBin, $rrBin, $rrChaosMode);
 }
 
 function generate_reproducer_script(
@@ -1401,7 +1528,9 @@ function generate_reproducer_script(
     array $phpArgs,
     array $runArgs,
     string $finalCommand,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
 ): void {
     if (!should_generate_script($runArgs)) {
         return;
@@ -1457,7 +1586,7 @@ function generate_reproducer_script(
         return;
     }
 
-    write_run_reproducer($jobDir, $phpBin, $phpIni, $phpArgs, $valgrindBin);
+    write_run_reproducer($jobDir, $phpBin, $phpIni, $phpArgs, $valgrindBin, $rrBin, $rrChaosMode);
 
     @chmod($scriptPath, 0755);
     if (is_file($stderrPath) && filesize($stderrPath) === 0) {
@@ -1475,7 +1604,9 @@ function create_script_job(
     ?int $maxSeconds,
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
-    ?string $valgrindBin
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
 ): array {
     $dynamicArgs = array_map('replace_dynamic', $commandArgs);
     $dynamicPhpArgs = array_map('replace_dynamic', $phpArgs);
@@ -1485,7 +1616,17 @@ function create_script_job(
     $generatorCommandString = render_command($generatorCommand);
 
     $scriptDir = create_temp_dir('relay-harness-script-');
-    generate_reproducer_script($scriptDir, $phpBin, $phpIni, $dynamicPhpArgs, $runArgs, $generatorCommandString, $valgrindBin);
+    generate_reproducer_script(
+        $scriptDir,
+        $phpBin,
+        $phpIni,
+        $dynamicPhpArgs,
+        $runArgs,
+        $generatorCommandString,
+        $valgrindBin,
+        $rrBin,
+        $rrChaosMode
+    );
 
     $scriptPath = $scriptDir . '/reproducer.php';
     if (!is_file($scriptPath)) {
@@ -1499,13 +1640,13 @@ function create_script_job(
     }
 
     $scriptCommand = build_php_command($phpBin, $phpIni, $dynamicPhpArgs, [$scriptPath]);
-    $job = start_command($scriptCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $valgrindBin);
+    $job = start_command($scriptCommand, $phpBin, $maxSeconds, $timeoutSignalArg, $timeoutSignal, $valgrindBin, $rrBin, $rrChaosMode);
     $job['id'] = $jobId;
     $job['dynamic_args'] = $dynamicArgs;
     $job['php_args'] = $dynamicPhpArgs;
     $job['full_command'] = $scriptCommand;
     $job['command_string'] = $job['command_string'] ?? render_command(
-        build_exec_command($scriptCommand, $valgrindBin, $job['valgrind_log_path'] ?? null)
+        build_exec_command($scriptCommand, $valgrindBin, $job['valgrind_log_path'] ?? null, $rrBin, $rrChaosMode)
     );
     $job['ops'] = $currentOps;
     $job['script_dir'] = $scriptDir;
@@ -1527,6 +1668,8 @@ function reduce_ops(
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
     ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode,
     bool $onlyCrashes,
     float $renderInterval,
     float &$lastRenderTime
@@ -1545,12 +1688,16 @@ function reduce_ops(
             $timeoutSignalArg,
             $timeoutSignal,
             $onlyCrashes,
-            $valgrindBin
+            $valgrindBin,
+            $rrBin,
+            $rrChaosMode
         );
         $commandString = render_command(build_exec_command(
             $fullCommand,
             $valgrindBin,
-            $result['valgrind_log_path'] ?? null
+            $result['valgrind_log_path'] ?? null,
+            $rrBin,
+            $rrChaosMode
         ));
         $stats['runs']++;
         $stats['last_command'] = $commandString;
@@ -1587,6 +1734,8 @@ function reduce_ops_script(
     ?string $timeoutSignalArg,
     ?int $timeoutSignal,
     ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode,
     bool $onlyCrashes,
     float $renderInterval,
     float &$lastRenderTime
@@ -1601,7 +1750,17 @@ function reduce_ops_script(
         $generatorCommandString = render_command($generatorCommand);
 
         $scriptDir = create_temp_dir('relay-harness-reduce-');
-        generate_reproducer_script($scriptDir, $phpBin, $phpIni, $phpArgs, $runArgs, $generatorCommandString, $valgrindBin);
+        generate_reproducer_script(
+            $scriptDir,
+            $phpBin,
+            $phpIni,
+            $phpArgs,
+            $runArgs,
+            $generatorCommandString,
+            $valgrindBin,
+            $rrBin,
+            $rrChaosMode
+        );
         $scriptPath = $scriptDir . '/reproducer.php';
         if (!is_file($scriptPath)) {
             remove_dir_recursive($scriptDir);
@@ -1617,12 +1776,16 @@ function reduce_ops_script(
             $timeoutSignalArg,
             $timeoutSignal,
             $onlyCrashes,
-            $valgrindBin
+            $valgrindBin,
+            $rrBin,
+            $rrChaosMode
         );
         $commandString = render_command(build_exec_command(
             $scriptCommand,
             $valgrindBin,
-            $result['valgrind_log_path'] ?? null
+            $result['valgrind_log_path'] ?? null,
+            $rrBin,
+            $rrChaosMode
         ));
         $stats['runs']++;
         $stats['last_command'] = $commandString;
@@ -1880,6 +2043,11 @@ function cleanup_output_files(array $result): void
             @unlink($path);
         }
     }
+
+    $rrTraceDir = $result['rr_trace_dir'] ?? null;
+    if (is_string($rrTraceDir) && $rrTraceDir !== '' && is_dir($rrTraceDir)) {
+        remove_dir_recursive($rrTraceDir);
+    }
 }
 
 function move_output_files(array $result, string $destinationDir): array
@@ -1936,9 +2104,32 @@ function rename_output_file(string $destinationDir, string $sourceName, string $
     @rename($sourcePath, $targetPath);
 }
 
-function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $reproduced): string
+function move_rr_trace_dir(?string $rrTraceDir, string $destinationDir, string $targetName = 'rr-trace'): ?string
 {
-    $bucket = $reproduced ? 'reproducing' : 'non-reproducing';
+    if (!is_string($rrTraceDir) || $rrTraceDir === '' || !is_dir($rrTraceDir)) {
+        return null;
+    }
+
+    $target = $destinationDir . '/' . $targetName;
+    if (file_exists($target)) {
+        remove_dir_recursive($target);
+    }
+
+    if (@rename($rrTraceDir, $target)) {
+        return $targetName;
+    }
+
+    if (copy_path_recursive($rrTraceDir, $target)) {
+        remove_dir_recursive($rrTraceDir);
+        return $targetName;
+    }
+
+    return null;
+}
+
+function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $reproduced, ?string $bucket = null): string
+{
+    $bucket ??= $reproduced ? REPRODUCER_BUCKET_REPRODUCING : REPRODUCER_BUCKET_NON_REPRODUCING;
     $bucketDir = $reproducersDir . '/' . $bucket;
     if (!is_dir($bucketDir) && !mkdir($bucketDir, 0777, true) && !is_dir($bucketDir)) {
         return $jobDir;
@@ -1965,7 +2156,7 @@ function move_reproducer_dir(string $jobDir, string $reproducersDir, bool $repro
 function next_reproducer_sequence(string $storageDir): int
 {
     $max = 0;
-    foreach (['reproducing', 'non-reproducing'] as $bucket) {
+    foreach (REPRODUCER_BUCKETS as $bucket) {
         $bucketDir = $storageDir . '/' . $bucket;
         if (!is_dir($bucketDir)) {
             continue;
@@ -2165,6 +2356,8 @@ $jobs = 1;
 $renderInterval = 1.0;
 $reproTries = 1;
 $valgrindBin = null;
+$rrBin = null;
+$rrChaosMode = false;
 $commandArgs = [];
 
 for ($i = 1; $i < $argc; $i++) {
@@ -2247,6 +2440,17 @@ for ($i = 1; $i < $argc; $i++) {
             exit(1);
         }
         $valgrindBin = $value;
+        continue;
+    }
+
+    if ($arg === '--rr') {
+        $rrBin = 'rr';
+        continue;
+    }
+
+    if ($arg === '--rr-chaos-mode') {
+        $rrBin = 'rr';
+        $rrChaosMode = true;
         continue;
     }
 
@@ -2397,6 +2601,12 @@ if ($valgrindBin !== null && $harnessMode !== 'script') {
     exit(1);
 }
 
+if ($valgrindBin !== null && $rrBin !== null) {
+    fwrite(STDERR, "--rr and --valgrind cannot be combined\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
 if ($valgrindBin !== null) {
     $resolvedValgrind = resolve_executable_path($valgrindBin);
     if ($resolvedValgrind === '' || !is_file($resolvedValgrind) || !is_executable($resolvedValgrind)) {
@@ -2404,6 +2614,15 @@ if ($valgrindBin !== null) {
         exit(1);
     }
     $valgrindBin = $resolvedValgrind;
+}
+
+if ($rrBin !== null) {
+    $resolvedRr = resolve_executable_path($rrBin);
+    if ($resolvedRr === '' || !is_file($resolvedRr) || !is_executable($resolvedRr)) {
+        fwrite(STDERR, "rr binary not found or not executable: {$rrBin}\n");
+        exit(1);
+    }
+    $rrBin = $resolvedRr;
 }
 
 ensure_core_ulimit_unlimited();
@@ -2461,7 +2680,9 @@ while (true) {
                 $maxSeconds,
                 $timeoutSignalArg,
                 $timeoutSignal,
-                $valgrindBin
+                $valgrindBin,
+                $rrBin,
+                $rrChaosMode
             );
         } else {
             $job = create_job(
@@ -2474,7 +2695,9 @@ while (true) {
                 $maxSeconds,
                 $timeoutSignalArg,
                 $timeoutSignal,
-                $valgrindBin
+                $valgrindBin,
+                $rrBin,
+                $rrChaosMode
             );
         }
         $runningJobs[$job['id']] = $job;
@@ -2598,6 +2821,8 @@ while (true) {
                     $timeoutSignalArg,
                     $timeoutSignal,
                     $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode,
                     $onlyCrashes,
                     $renderInterval,
                     $lastRenderTime
@@ -2615,6 +2840,8 @@ while (true) {
                     $timeoutSignalArg,
                     $timeoutSignal,
                     $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode,
                     $onlyCrashes,
                     $renderInterval,
                     $lastRenderTime
@@ -2623,7 +2850,9 @@ while (true) {
                 $finalCommand = render_command(build_exec_command(
                     build_php_command($phpBin, $phpIni, $finalPhpArgs, $reducedArgs),
                     $valgrindBin,
-                    $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
+                    $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
+                    $rrBin,
+                    $rrChaosMode
                 ));
 
                 if ($finalCommand !== $crashJob['command_string']) {
@@ -2635,9 +2864,19 @@ while (true) {
         $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         if ($harnessMode === 'script') {
             $finalGeneratorCommand = render_command(build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs));
+        } elseif ($rrBin !== null) {
+            $finalExecCommand = build_exec_command(
+                build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs),
+                $valgrindBin,
+                null,
+                $rrBin,
+                $rrChaosMode
+            );
+            $finalCommand = render_exec_command($finalExecCommand, $jobDir . '/rr-reproducer-trace');
         }
 
         $outputFiles = move_output_files($crashResult, $jobDir);
+        $rrTraceDir = move_rr_trace_dir($crashResult['rr_trace_dir'] ?? null, $jobDir);
         cleanup_output_files($crashResult);
 
         if ($harnessMode === 'script') {
@@ -2649,7 +2888,9 @@ while (true) {
                     $phpBin,
                     $phpIni,
                     $finalPhpArgs,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
             } else {
                 generate_reproducer_script(
@@ -2659,14 +2900,19 @@ while (true) {
                     $finalPhpArgs,
                     $finalRunArgs,
                     $finalGeneratorCommand ?? $finalCommand,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
             }
-            $finalCommand = render_command(build_exec_command(
+            $finalExecCommand = build_exec_command(
                 build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
                 $valgrindBin,
-                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
-            ));
+                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
+                $rrBin,
+                $rrChaosMode
+            );
+            $finalCommand = render_exec_command($finalExecCommand, $rrBin !== null ? $jobDir . '/rr-reproducer-trace' : null);
             file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
             if ($finalGeneratorCommand !== null) {
                 file_put_contents($jobDir . '/generator-command.txt', $finalGeneratorCommand . "\n");
@@ -2683,7 +2929,9 @@ while (true) {
                 $finalPhpArgs,
                 $finalRunArgs,
                 $finalCommand,
-                $valgrindBin
+                $valgrindBin,
+                $rrBin,
+                $rrChaosMode
             );
         }
 
@@ -2731,15 +2979,22 @@ while (true) {
         if ($outputFiles !== []) {
             $reportData['output_files'] = $outputFiles;
         }
+        if ($rrTraceDir !== null) {
+            $reportData['rr_trace_dir'] = $rrTraceDir;
+            $reportData['rr_chaos_mode'] = $rrChaosMode;
+        }
         if ($harnessMode === 'script' && $finalGeneratorCommand !== null) {
             $reportData['generator_command'] = $finalGeneratorCommand;
         }
 
         write_report_files($jobDir, $reportData);
         $reproducerScript = $jobDir . '/reproducer.php';
-        $reproducerCrash = false;
+        $reproducerCrash = $rrBin !== null && $rrTraceDir !== null;
         $reproducerExecutionMs = null;
-        if (is_file($reproducerScript)) {
+        if ($reproducerCrash) {
+            $reportData['reproducer_status'] = 'recorded-by-rr';
+            write_report_files($jobDir, $reportData);
+        } elseif (is_file($reproducerScript)) {
             $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
             for ($attempt = 1; $attempt <= $reproTries; $attempt++) {
                 $stats['last_event'] = $reproTries > 1
@@ -2752,7 +3007,9 @@ while (true) {
                     $timeoutSignalArg,
                     $timeoutSignal,
                     $onlyCrashes,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
                 $reproducerExecutionMs = ($reproducerExecutionMs ?? 0) + (int)($reproducerResult['execution_ms'] ?? 0);
                 if ($valgrindBin !== null) {
@@ -2806,7 +3063,12 @@ while (true) {
             write_report_files($jobDir, $reportData);
         }
 
-        $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
+        $finalJobDir = move_reproducer_dir(
+            $jobDir,
+            $reproducersDir,
+            $reproducerCrash,
+            $reproducerCrash && $rrBin !== null ? REPRODUCER_BUCKET_REPRODUCABLE : null
+        );
         write_gdb_shim($finalJobDir, $phpBin);
         if ($harnessMode === 'script' && isset($crashJob['script_dir'])) {
             remove_dir_recursive((string) $crashJob['script_dir']);
@@ -2850,11 +3112,21 @@ while (true) {
         $finalRunArgs = array_map(static fn(string $arg): string => apply_ops($arg, $finalOps), $dynamicArgs);
         if ($harnessMode === 'script') {
             $finalGeneratorCommand = render_command(build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs));
+        } elseif ($rrBin !== null) {
+            $finalExecCommand = build_exec_command(
+                build_php_command($phpBin, $phpIni, $finalPhpArgs, $finalRunArgs),
+                $valgrindBin,
+                null,
+                $rrBin,
+                $rrChaosMode
+            );
+            $finalCommand = render_exec_command($finalExecCommand, $jobDir . '/rr-reproducer-trace');
         } else {
             file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
         }
 
         $outputFiles = move_output_files($leakResult, $jobDir);
+        $rrTraceDir = move_rr_trace_dir($leakResult['rr_trace_dir'] ?? null, $jobDir);
         cleanup_output_files($leakResult);
 
         if ($harnessMode === 'script') {
@@ -2865,7 +3137,9 @@ while (true) {
                     $phpBin,
                     $phpIni,
                     $finalPhpArgs,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
             } else {
                 generate_reproducer_script(
@@ -2875,19 +3149,25 @@ while (true) {
                     $finalPhpArgs,
                     $finalRunArgs,
                     $finalGeneratorCommand ?? $finalCommand,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
             }
-            $finalCommand = render_command(build_exec_command(
+            $finalExecCommand = build_exec_command(
                 build_php_command($phpBin, $phpIni, $finalPhpArgs, [$jobDir . '/reproducer.php']),
                 $valgrindBin,
-                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null
-            ));
+                $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
+                $rrBin,
+                $rrChaosMode
+            );
+            $finalCommand = render_exec_command($finalExecCommand, $rrBin !== null ? $jobDir . '/rr-reproducer-trace' : null);
             file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
             if ($finalGeneratorCommand !== null) {
                 file_put_contents($jobDir . '/generator-command.txt', $finalGeneratorCommand . "\n");
             }
         } else {
+            file_put_contents($jobDir . '/command.txt', $finalCommand . "\n");
             generate_reproducer_script(
                 $jobDir,
                 $phpBin,
@@ -2895,7 +3175,9 @@ while (true) {
                 $finalPhpArgs,
                 $finalRunArgs,
                 $finalCommand,
-                $valgrindBin
+                $valgrindBin,
+                $rrBin,
+                $rrChaosMode
             );
         }
 
@@ -2947,6 +3229,10 @@ while (true) {
         if ($outputFiles !== []) {
             $reportData['output_files'] = $outputFiles;
         }
+        if ($rrTraceDir !== null) {
+            $reportData['rr_trace_dir'] = $rrTraceDir;
+            $reportData['rr_chaos_mode'] = $rrChaosMode;
+        }
         if ($harnessMode === 'script' && $finalGeneratorCommand !== null) {
             $reportData['generator_command'] = $finalGeneratorCommand;
         }
@@ -2968,7 +3254,9 @@ while (true) {
                     $timeoutSignalArg,
                     $timeoutSignal,
                     $onlyCrashes,
-                    $valgrindBin
+                    $valgrindBin,
+                    $rrBin,
+                    $rrChaosMode
                 );
                 $reproducerExecutionMs = ($reproducerExecutionMs ?? 0) + (int)($reproducerResult['execution_ms'] ?? 0);
                 $reproducerLeak = parse_php_leak_count(

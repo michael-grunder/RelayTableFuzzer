@@ -8,12 +8,13 @@ $sortKey = 'lines';
 $reproducersDir = null;
 $oneLine = false;
 $statusFilter = null;
+$knownBuckets = ['reproducable', 'reproducing', 'non-reproducing'];
 
 foreach (array_slice($args, 1) as $arg) {
     if ($arg === '-h' || $arg === '--help') {
         fwrite(
             STDOUT,
-            "Usage: reproducers [path] [--sort=lines|ops|mtime|name] [--oneline] [--reproducing|--non-reproducing]\n"
+            "Usage: reproducers [path] [--sort=lines|ops|mtime|name] [--oneline] [--reproducable|--reproducing|--non-reproducing]\n"
         );
         exit(0);
     }
@@ -23,6 +24,10 @@ foreach (array_slice($args, 1) as $arg) {
     }
     if ($arg === '--reproducing') {
         $statusFilter = 'reproducing';
+        continue;
+    }
+    if ($arg === '--reproducable') {
+        $statusFilter = 'reproducable';
         continue;
     }
     if ($arg === '--non-reproducing') {
@@ -39,9 +44,14 @@ foreach (array_slice($args, 1) as $arg) {
 }
 
 if ($statusFilter !== null) {
-    $opposite = $statusFilter === 'reproducing' ? '--non-reproducing' : '--reproducing';
-    if (in_array($opposite, $args, true)) {
-        fwrite(STDERR, "cannot combine --reproducing and --non-reproducing\n");
+    $selected = 0;
+    foreach ($knownBuckets as $bucket) {
+        if (in_array('--' . $bucket, $args, true)) {
+            $selected++;
+        }
+    }
+    if ($selected > 1) {
+        fwrite(STDERR, "cannot combine reproducer status filters\n");
         exit(1);
     }
 }
@@ -194,7 +204,7 @@ function collect_rows(string $reproducersDir, ?string $statusFilter): array
             continue;
         }
 
-        if ($entry === 'reproducing' || $entry === 'non-reproducing') {
+        if (in_array($entry, ['reproducable', 'reproducing', 'non-reproducing'], true)) {
             $bucketDirs[$entry] = $dir;
             continue;
         }
@@ -206,7 +216,7 @@ function collect_rows(string $reproducersDir, ?string $statusFilter): array
         $rows[] = build_row($entry, $dir, 'unknown');
     }
 
-    foreach (['reproducing', 'non-reproducing'] as $bucket) {
+    foreach (['reproducable', 'reproducing', 'non-reproducing'] as $bucket) {
         if ($statusFilter !== null && $statusFilter !== $bucket) {
             continue;
         }

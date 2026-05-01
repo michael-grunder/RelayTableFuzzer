@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added `--repro-tries` to `bin/harness` to retry reproducer runs before classifying crashes or leaks.
 - Added `--valgrind` support to `bin/harness` (script mode) to capture valgrind logs and classify reproducers by valgrind errors.
+- Added `--rr` and `--rr-chaos-mode` to `bin/harness` to record crashing runs with rr and archive traces under `reproducers/reproducable`.
 - Added `bin/final-reduce-script` to reduce script-mode reproducers by removing whole worker `Table::` statements, with forwarded PHP args and `--max-runs` retry support for nondeterministic crashes.
 - Added `--valgrind` and `--timeout` to `bin/final-reduce-script`; valgrind mode classifies crashes by valgrind memory errors only (leaks ignored), while timeout mode lets reducer treat infinite loops as reproducible failures.
 - Added `-v`/`-vv` verbosity controls to `bin/final-reduce-script` for richer runtime progress and retry diagnostics.

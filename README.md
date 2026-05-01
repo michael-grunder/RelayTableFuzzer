@@ -38,6 +38,16 @@ To run the script-mode harness under valgrind, add `--mode=script --valgrind`:
 ./bin/harness --mode=script --valgrind --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
 ```
 
+To record crashes with rr, add `--rr`. Use `--rr-chaos-mode` to also pass
+`-h` to `rr record` for randomized scheduling:
+
+```bash
+./bin/harness --rr --php-bin ./php85d --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
+```
+
+`--rr` cannot be combined with `--valgrind`. rr-recorded crashes are saved under
+`reproducers/reproducable/` with the trace directory stored as `rr-trace`.
+
 To try reproducing a crash multiple times before classifying it, pass `--repro-tries`:
 
 ```bash
