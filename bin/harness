@@ -159,6 +159,43 @@ function apply_ops(string $arg, ?int $ops): string
     return str_replace('{ops}', (string)$ops, $arg);
 }
 
+function extract_ops_from_args(array $args): ?int
+{
+    $count = count($args);
+    for ($i = 0; $i < $count; $i++) {
+        $arg = $args[$i];
+        if (!is_string($arg)) {
+            continue;
+        }
+
+        if ($arg === '--ops') {
+            $value = $args[$i + 1] ?? null;
+            return is_numeric($value) ? (int) $value : null;
+        }
+
+        if (str_starts_with($arg, '--ops=')) {
+            $value = substr($arg, strlen('--ops='));
+            return is_numeric($value) ? (int) $value : null;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * @param array<string, bool|int|string|array<int, string>> $reportData
+ * @return array<string, bool|int|string|array<int, string>>
+ */
+function with_report_ops(array $reportData, ?int $ops): array
+{
+    if (isset($reportData['ops']) || $ops === null) {
+        return $reportData;
+    }
+
+    $reportData['ops'] = $ops;
+    return $reportData;
+}
+
 function build_php_command(string $phpBin, ?string $phpIni, array $phpArgs, array $runArgs): array
 {
     $iniArgs = ($phpIni !== null && $phpIni !== '') ? ['-c', $phpIni] : [];
@@ -898,6 +935,7 @@ function collect_recent_reproducers(array $roots, int $limit): array
                 $entries[] = [
                     'time' => $mtime,
                     'failure_type' => reproducer_failure_type($report, $rootType, $dir),
+                    'ops' => isset($report['ops']) && is_numeric($report['ops']) ? (int) $report['ops'] : null,
                     'path' => display_path($dir),
                 ];
             }
@@ -917,19 +955,21 @@ function render_recent_reproducers_table(array $entries): TableWidget
         $rows[] = TableRow::fromStrings(
             format_age((int) $entry['time'], $now),
             (string) $entry['failure_type'],
+            $entry['ops'] !== null ? (string) $entry['ops'] : '-',
             (string) $entry['path'],
         );
     }
 
     if ($rows === []) {
-        $rows[] = TableRow::fromStrings('-', 'none', 'no reproducers saved yet');
+        $rows[] = TableRow::fromStrings('-', 'none', '-', 'no reproducers saved yet');
     }
 
     return TableWidget::default()
-        ->header(TableRow::fromStrings('Age', 'Failure', 'Path'))
+        ->header(TableRow::fromStrings('Age', 'Failure', 'Ops', 'Path'))
         ->widths(
             Constraint::length(7),
             Constraint::length(32),
+            Constraint::length(8),
             Constraint::min(20),
         )
         ->rows(...$rows);
@@ -3072,6 +3112,7 @@ while (true) {
         $signalDesc = $signal !== null ? signal_description($signal) : '';
         $exitName = build_failure_summary($crashResult);
         $exitType = extract_gdb_error_type($jobDir) ?? normalize_failure_label($exitName);
+        $reportOps = $finalOps ?? extract_ops_from_args($finalRunArgs);
 
         $reportData = [
             'command' => $finalCommand,
@@ -3080,9 +3121,7 @@ while (true) {
             'exit_type' => $exitType,
             'signal' => $signalLabel,
         ];
-        if ($finalOps !== null) {
-            $reportData['ops'] = $finalOps;
-        }
+        $reportData = with_report_ops($reportData, $reportOps);
         if ($signalDesc !== '') {
             $reportData['signal_desc'] = $signalDesc;
         }
@@ -3322,6 +3361,7 @@ while (true) {
         $signalDesc = $signal !== null ? signal_description($signal) : '';
         $exitName = build_failure_summary($leakResult);
         $exitType = extract_gdb_error_type($jobDir) ?? normalize_failure_label($exitName);
+        $reportOps = $finalOps ?? extract_ops_from_args($finalRunArgs);
 
         $reportData = [
             'command' => $finalCommand,
@@ -3330,9 +3370,7 @@ while (true) {
             'exit_type' => $exitType,
             'signal' => $signalLabel,
         ];
-        if ($finalOps !== null) {
-            $reportData['ops'] = $finalOps;
-        }
+        $reportData = with_report_ops($reportData, $reportOps);
         if ($signalDesc !== '') {
             $reportData['signal_desc'] = $signalDesc;
         }
