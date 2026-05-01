@@ -80,6 +80,33 @@ function signal_description(int $signal): string
     return '';
 }
 
+function elapsed_ms(float $start): int
+{
+    return max(0, (int)round((microtime(true) - $start) * 1000));
+}
+
+/**
+ * @param array<string, bool|int|string|array<int, string>> $reportData
+ */
+function write_report_files(string $jobDir, array $reportData): void
+{
+    $report = [];
+    foreach ($reportData as $key => $value) {
+        if (is_array($value)) {
+            $value = implode(', ', $value);
+        } elseif (is_bool($value)) {
+            $value = $value ? 'yes' : 'no';
+        }
+        $report[] = "{$key}: {$value}";
+    }
+
+    file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
+    file_put_contents(
+        $jobDir . '/report.json',
+        json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+    );
+}
+
 function replace_dynamic(string $arg): string
 {
     $arg = preg_replace_callback('/\{range\((\-?\d+)\s*,\s*(\-?\d+)\)\}/', static function (array $matches): string {
@@ -1012,9 +1039,9 @@ function run_command(
         exit(1);
     }
 
+    $start = microtime(true);
     $status = proc_get_status($process);
     $pid = $status['pid'] ?? null;
-    $start = microtime(true);
     $timeoutBacktracePath = null;
     $timeoutBacktraceSimplePath = null;
     $timedOut = false;
@@ -1074,6 +1101,7 @@ function run_command(
 
     return [
         'exit_code' => $exitCode,
+        'execution_ms' => elapsed_ms($start),
         'signal' => $signal,
         'pid' => $pid,
         'timed_out' => $timedOut,
@@ -1142,6 +1170,7 @@ function start_command(
 function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $onlyCrashes): array
 {
     $exitCode = proc_close($job['process']);
+    $executionMs = elapsed_ms((float)($job['start_time'] ?? microtime(true)));
     $timedOut = (bool)($job['timed_out'] ?? false);
 
     $signal = null;
@@ -1171,6 +1200,7 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $
 
     return [
         'exit_code' => $exitCode,
+        'execution_ms' => $executionMs,
         'signal' => $signal,
         'pid' => $job['pid'],
         'timed_out' => $job['timed_out'] || $timedOut,
@@ -2666,23 +2696,10 @@ while (true) {
             $reportData['generator_command'] = $finalGeneratorCommand;
         }
 
-        $report = [];
-        foreach ($reportData as $key => $value) {
-            if (is_array($value)) {
-                $value = implode(', ', $value);
-            } elseif (is_bool($value)) {
-                $value = $value ? 'yes' : 'no';
-            }
-            $report[] = "{$key}: {$value}";
-        }
-
-        file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
-        file_put_contents(
-            $jobDir . '/report.json',
-            json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
-        );
+        write_report_files($jobDir, $reportData);
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerCrash = false;
+        $reproducerExecutionMs = null;
         if (is_file($reproducerScript)) {
             $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
             for ($attempt = 1; $attempt <= $reproTries; $attempt++) {
@@ -2698,6 +2715,7 @@ while (true) {
                     $onlyCrashes,
                     $valgrindBin
                 );
+                $reproducerExecutionMs = ($reproducerExecutionMs ?? 0) + (int)($reproducerResult['execution_ms'] ?? 0);
                 if ($valgrindBin !== null) {
                     $reproducerCrash = (int)($reproducerResult['valgrind_errors'] ?? 0) > 0;
                 } else {
@@ -2743,6 +2761,10 @@ while (true) {
                     break;
                 }
             }
+        }
+        if ($reproducerExecutionMs !== null) {
+            $reportData['reproducer_execution_ms'] = $reproducerExecutionMs;
+            write_report_files($jobDir, $reportData);
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $reproducersDir, $reproducerCrash);
@@ -2889,23 +2911,10 @@ while (true) {
             $reportData['generator_command'] = $finalGeneratorCommand;
         }
 
-        $report = [];
-        foreach ($reportData as $key => $value) {
-            if (is_array($value)) {
-                $value = implode(', ', $value);
-            } elseif (is_bool($value)) {
-                $value = $value ? 'yes' : 'no';
-            }
-            $report[] = "{$key}: {$value}";
-        }
-
-        file_put_contents($jobDir . '/report.txt', implode("\n", $report) . "\n");
-        file_put_contents(
-            $jobDir . '/report.json',
-            json_encode($reportData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
-        );
+        write_report_files($jobDir, $reportData);
         $reproducerScript = $jobDir . '/reproducer.php';
         $reproducerLeak = false;
+        $reproducerExecutionMs = null;
         if (is_file($reproducerScript)) {
             $reproducerCommand = build_php_command($phpBin, $phpIni, $finalPhpArgs, [$reproducerScript]);
             for ($attempt = 1; $attempt <= $reproTries; $attempt++) {
@@ -2921,6 +2930,7 @@ while (true) {
                     $onlyCrashes,
                     $valgrindBin
                 );
+                $reproducerExecutionMs = ($reproducerExecutionMs ?? 0) + (int)($reproducerResult['execution_ms'] ?? 0);
                 $reproducerLeak = parse_php_leak_count(
                     $reproducerResult['stdout_path'],
                     $reproducerResult['stderr_path']
@@ -2965,6 +2975,10 @@ while (true) {
                     break;
                 }
             }
+        }
+        if ($reproducerExecutionMs !== null) {
+            $reportData['reproducer_execution_ms'] = $reproducerExecutionMs;
+            write_report_files($jobDir, $reportData);
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $leaksDir, $reproducerLeak);
