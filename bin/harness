@@ -444,6 +444,34 @@ function write_run_reproducer(
     write_php_shim($jobDir, $runnerPhpBin, $phpIniLine, $phpIniArg, $phpArgs);
 }
 
+function rewrite_saved_reproducer_command(
+    string $jobDir,
+    array &$reportData,
+    string $phpBin,
+    ?string $phpIni,
+    array $phpArgs,
+    ?string $valgrindBin,
+    ?string $rrBin,
+    bool $rrChaosMode
+): void {
+    $reproducerScript = $jobDir . '/reproducer.php';
+    if (!is_file($reproducerScript)) {
+        return;
+    }
+
+    $execCommand = build_exec_command(
+        build_php_command($phpBin, $phpIni, $phpArgs, [$reproducerScript]),
+        $valgrindBin,
+        $valgrindBin !== null ? $jobDir . '/valgrind.log' : null,
+        $rrBin,
+        $rrChaosMode
+    );
+    $command = render_exec_command($execCommand, $rrBin !== null ? $jobDir . '/rr-reproducer-trace' : null);
+    $reportData['command'] = $command;
+    file_put_contents($jobDir . '/command.txt', $command . "\n");
+    write_report_files($jobDir, $reportData);
+}
+
 function write_php_shim(
     string $jobDir,
     string $runnerPhpBin,
@@ -1142,6 +1170,51 @@ function find_core_dumps(string $phpBin, ?int $pid, ?float $startTime = null): a
     }));
 }
 
+/**
+ * @param array<int, true> $seen
+ * @return array<int, true>
+ */
+function collect_process_tree_pids(?int $pid, array &$seen = []): array
+{
+    if ($pid === null || $pid <= 0 || isset($seen[$pid])) {
+        return $seen;
+    }
+
+    $seen[$pid] = true;
+    $childrenPath = "/proc/{$pid}/task/{$pid}/children";
+    $children = @file_get_contents($childrenPath);
+    if (!is_string($children) || trim($children) === '') {
+        return $seen;
+    }
+
+    foreach (preg_split('/\s+/', trim($children)) ?: [] as $childPid) {
+        if (ctype_digit($childPid)) {
+            collect_process_tree_pids((int)$childPid, $seen);
+        }
+    }
+
+    return $seen;
+}
+
+/**
+ * @param array<int, true> $pids
+ * @return list<string>
+ */
+function find_core_dumps_for_pids(string $phpBin, array $pids): array
+{
+    $cores = [];
+    foreach (array_keys($pids) as $pid) {
+        foreach (find_core_dumps($phpBin, (int)$pid) as $coreFile) {
+            $cores[$coreFile] = true;
+        }
+    }
+
+    $paths = array_keys($cores);
+    sort($paths);
+
+    return $paths;
+}
+
 function parse_timeout_signal(?string $value): ?array
 {
     if ($value === null || $value === '') {
@@ -1202,12 +1275,14 @@ function run_command(
     $start = microtime(true);
     $status = proc_get_status($process);
     $pid = $status['pid'] ?? null;
+    $observedPids = collect_process_tree_pids(is_int($pid) ? $pid : null);
     $timeoutBacktracePath = null;
     $timeoutBacktraceSimplePath = null;
     $timedOut = false;
     $timeoutRequestedAt = null;
 
     while ($status['running']) {
+        collect_process_tree_pids(is_int($pid) ? $pid : null, $observedPids);
         if (
             !$timedOut
             && $maxSeconds !== null
@@ -1249,7 +1324,10 @@ function run_command(
     }
 
     $usesTimeout = $maxSeconds !== null;
-    $coreFiles = find_core_dumps($phpBin, $usesTimeout ? null : $pid, $start);
+    $coreFiles = find_core_dumps_for_pids($phpBin, $observedPids);
+    if ($coreFiles === [] && $timedOut && $usesTimeout) {
+        $coreFiles = find_core_dumps($phpBin, null, $start);
+    }
     $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
     $valgrindErrors = parse_valgrind_error_count($valgrindLogPath);
     if (is_int($valgrindErrors) && $valgrindErrors > 0) {
@@ -1318,6 +1396,7 @@ function start_command(
     return [
         'process' => $process,
         'pid' => $status['pid'] ?? null,
+        'observed_pids' => collect_process_tree_pids(is_int($status['pid'] ?? null) ? $status['pid'] : null),
         'max_seconds' => $maxSeconds,
         'start_time' => microtime(true),
         'php_bin' => $phpBin,
@@ -1354,11 +1433,11 @@ function finalize_command(array $job, array $status, ?int $timeoutSignal, bool $
         $signal = null;
     }
 
-    $coreFiles = find_core_dumps(
-        $job['php_bin'],
-        empty($job['uses_timeout']) ? $job['pid'] : null,
-        $job['start_time'] ?? null
-    );
+    $observedPids = is_array($job['observed_pids'] ?? null) ? $job['observed_pids'] : [];
+    $coreFiles = find_core_dumps_for_pids($job['php_bin'], $observedPids);
+    if ($coreFiles === [] && $timedOut && !empty($job['uses_timeout'])) {
+        $coreFiles = find_core_dumps($job['php_bin'], null, $job['start_time'] ?? null);
+    }
     $isCrash = ($signal !== null && in_array($signal, CRASH_SIGNALS, true)) || $coreFiles !== [];
     $valgrindErrors = parse_valgrind_error_count($job['valgrind_log_path'] ?? null);
     if (is_int($valgrindErrors) && $valgrindErrors > 0) {
@@ -1392,6 +1471,11 @@ function poll_command(array &$job, ?int $timeoutSignal, bool $onlyCrashes): ?arr
 {
     $status = proc_get_status($job['process']);
     if ($status['running']) {
+        collect_process_tree_pids(
+            is_int($job['pid'] ?? null) ? $job['pid'] : null,
+            $job['observed_pids']
+        );
+
         if (!empty($job['cancelled'])) {
             proc_terminate($job['process']);
             $cancelAt = $job['cancel_requested_at'] ?? $job['start_time'];
@@ -3238,6 +3322,16 @@ while (true) {
             $reproducerCrash,
             $reproducerCrash && $rrBin !== null ? REPRODUCER_BUCKET_REPRODUCABLE : null
         );
+        rewrite_saved_reproducer_command(
+            $finalJobDir,
+            $reportData,
+            $phpBin,
+            $phpIni,
+            $finalPhpArgs,
+            $valgrindBin,
+            $rrBin,
+            $rrChaosMode
+        );
         write_gdb_shim($finalJobDir, $phpBin);
         if ($harnessMode === 'script' && isset($crashJob['script_dir'])) {
             remove_dir_recursive((string) $crashJob['script_dir']);
@@ -3478,6 +3572,16 @@ while (true) {
         }
 
         $finalJobDir = move_reproducer_dir($jobDir, $leaksDir, $reproducerLeak);
+        rewrite_saved_reproducer_command(
+            $finalJobDir,
+            $reportData,
+            $phpBin,
+            $phpIni,
+            $finalPhpArgs,
+            $valgrindBin,
+            $rrBin,
+            $rrChaosMode
+        );
         write_gdb_shim($finalJobDir, $phpBin);
         if ($harnessMode === 'script' && isset($leakJob['script_dir'])) {
             remove_dir_recursive((string) $leakJob['script_dir']);
