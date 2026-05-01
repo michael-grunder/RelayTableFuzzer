@@ -2047,6 +2047,8 @@ function run_rr_gdb_backtrace(string $rrBin, string $rrTraceDir, string $tracePa
         '-ex',
         'thread apply all bt full',
     ];
+    file_put_contents($tracePath . '.command.txt', render_command($rrCommand) . "\n");
+
     $process = proc_open($rrCommand, $descriptorSpec, $pipes);
     if (!is_resource($process)) {
         file_put_contents($tracePath, "failed to start rr replay\n");
@@ -2065,6 +2067,53 @@ function run_rr_gdb_backtrace(string $rrBin, string $rrTraceDir, string $tracePa
     }
 }
 
+function is_rr_recording_trace_dir(string $path): bool
+{
+    foreach (['version', 'data', 'tasks', 'events', 'mmaps'] as $traceFile) {
+        if (!is_file($path . '/' . $traceFile)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function resolve_rr_replay_trace_dir(string $rrTraceDir): string
+{
+    if (is_rr_recording_trace_dir($rrTraceDir)) {
+        return $rrTraceDir;
+    }
+
+    $latestTrace = $rrTraceDir . '/latest-trace';
+    if (is_dir($latestTrace)) {
+        $resolved = realpath($latestTrace);
+        return is_string($resolved) ? $resolved : $latestTrace;
+    }
+
+    $entries = scandir($rrTraceDir);
+    if ($entries === false) {
+        return $rrTraceDir;
+    }
+
+    $traceDirs = [];
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..' || $entry === 'latest-trace') {
+            continue;
+        }
+
+        $path = $rrTraceDir . '/' . $entry;
+        if (is_dir($path) && is_rr_recording_trace_dir($path)) {
+            $traceDirs[] = $path;
+        }
+    }
+
+    if (count($traceDirs) !== 1) {
+        return $rrTraceDir;
+    }
+
+    return $traceDirs[0];
+}
+
 function generate_rr_backtrace(string $rrBin, string $rrTraceDir, string $destinationDir): ?string
 {
     if (!is_dir($rrTraceDir)) {
@@ -2073,7 +2122,7 @@ function generate_rr_backtrace(string $rrBin, string $rrTraceDir, string $destin
 
     $traceName = 'gdb-backtrace-rr.txt';
     $tracePath = $destinationDir . '/' . $traceName;
-    run_rr_gdb_backtrace($rrBin, $rrTraceDir, $tracePath);
+    run_rr_gdb_backtrace($rrBin, resolve_rr_replay_trace_dir($rrTraceDir), $tracePath);
 
     return $traceName;
 }
