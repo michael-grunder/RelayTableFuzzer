@@ -2024,6 +2024,60 @@ function generate_gdb_backtraces(array $coreFiles, string $destinationDir, strin
     }
 }
 
+function run_rr_gdb_backtrace(string $rrBin, string $rrTraceDir, string $tracePath): void
+{
+    $descriptorSpec = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['file', $tracePath, 'w'],
+        2 => ['file', $tracePath . '.err', 'w'],
+    ];
+    $rrCommand = [
+        $rrBin,
+        'replay',
+        $rrTraceDir,
+        '-M',
+        '--',
+        '-batch',
+        '-ex',
+        'set pagination off',
+        '-ex',
+        'set confirm off',
+        '-ex',
+        'continue',
+        '-ex',
+        'thread apply all bt full',
+    ];
+    $process = proc_open($rrCommand, $descriptorSpec, $pipes);
+    if (!is_resource($process)) {
+        file_put_contents($tracePath, "failed to start rr replay\n");
+        return;
+    }
+
+    $status = proc_get_status($process);
+    while (($status['running'] ?? false) === true) {
+        usleep(10000);
+        $status = proc_get_status($process);
+    }
+
+    $exitCode = proc_close($process);
+    if ($exitCode !== 0) {
+        file_put_contents($tracePath, "rr replay exit code: {$exitCode}\n", FILE_APPEND);
+    }
+}
+
+function generate_rr_backtrace(string $rrBin, string $rrTraceDir, string $destinationDir): ?string
+{
+    if (!is_dir($rrTraceDir)) {
+        return null;
+    }
+
+    $traceName = 'gdb-backtrace-rr.txt';
+    $tracePath = $destinationDir . '/' . $traceName;
+    run_rr_gdb_backtrace($rrBin, $rrTraceDir, $tracePath);
+
+    return $traceName;
+}
+
 function move_core_dumps(array $coreFiles, string $destinationDir): array
 {
     $moved = [];
@@ -2953,6 +3007,17 @@ while (true) {
         $signal = $crashResult['signal'];
         $exitCode = $crashResult['exit_code'];
         $pid = $crashResult['pid'];
+        $rrBacktracePath = null;
+        if (
+            $rrBin !== null
+            && $rrTraceDir !== null
+            && $signal !== null
+            && in_array($signal, CRASH_SIGNALS, true)
+        ) {
+            $stats['last_event'] = 'capturing rr backtrace';
+            maybe_render_screen($stats, $currentOps, 'capturing', $renderInterval, $lastRenderTime, true);
+            $rrBacktracePath = generate_rr_backtrace($rrBin, $jobDir . '/' . $rrTraceDir, $jobDir);
+        }
 
         $signalLabel = $signal !== null ? signal_label($signal) : 'none';
         $signalDesc = $signal !== null ? signal_description($signal) : '';
@@ -2994,6 +3059,9 @@ while (true) {
         if ($rrTraceDir !== null) {
             $reportData['rr_trace_dir'] = $rrTraceDir;
             $reportData['rr_chaos_mode'] = $rrChaosMode;
+        }
+        if ($rrBacktracePath !== null) {
+            $reportData['rr_backtrace'] = $rrBacktracePath;
         }
         if ($harnessMode === 'script' && $finalGeneratorCommand !== null) {
             $reportData['generator_command'] = $finalGeneratorCommand;

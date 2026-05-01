@@ -338,10 +338,25 @@ function extract_gdb_error_type(string $dir): ?string
             continue;
         }
 
+        $signalType = null;
+        $function = null;
         foreach ($lines as $line) {
             if (preg_match('/\b(?:Program terminated with|Program received|Thread \d+ .* received) signal (SIG[A-Z0-9]+)/', $line, $matches) === 1) {
-                return signal_error_type($matches[1]);
+                $signalType = signal_error_type($matches[1]);
+                continue;
             }
+
+            if ($function === null && preg_match('/^#0\s+.*?\bin\s+([^\s(]+)\s*(?:\(|$)/', $line, $matches) === 1) {
+                $function = $matches[1];
+            }
+
+            if ($signalType !== null && $function !== null) {
+                return "{$signalType}({$function})";
+            }
+        }
+
+        if ($signalType !== null) {
+            return $signalType;
         }
     }
 
