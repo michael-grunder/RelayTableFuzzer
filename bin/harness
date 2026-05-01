@@ -806,10 +806,25 @@ function extract_gdb_error_type(string $dir): ?string
             continue;
         }
 
+        $signalType = null;
+        $function = null;
         foreach ($lines as $line) {
             if (preg_match('/\b(?:Program terminated with|Program received|Thread \d+ .* received) signal (SIG[A-Z0-9]+)/', $line, $matches) === 1) {
-                return signal_error_type($matches[1]);
+                $signalType = signal_error_type($matches[1]);
+                continue;
             }
+
+            if ($function === null && preg_match('/^#0\s+.*?\bin\s+([^\s(]+)\s*(?:\(|$)/', $line, $matches) === 1) {
+                $function = $matches[1];
+            }
+
+            if ($signalType !== null && $function !== null) {
+                return "{$signalType}({$function})";
+            }
+        }
+
+        if ($signalType !== null) {
+            return $signalType;
         }
     }
 
@@ -852,11 +867,7 @@ function collect_recent_reproducers(array $roots, int $limit): array
         }
 
         $rootType = basename($root) === 'leaks' ? 'leaks' : 'reproducers';
-        foreach ([
-            REPRODUCER_BUCKET_REPRODUCABLE => true,
-            REPRODUCER_BUCKET_REPRODUCING => true,
-            REPRODUCER_BUCKET_NON_REPRODUCING => false,
-        ] as $bucket => $reproducing) {
+        foreach (REPRODUCER_BUCKETS as $bucket) {
             $bucketDir = $root . '/' . $bucket;
             if (!is_dir($bucketDir)) {
                 continue;
@@ -887,7 +898,6 @@ function collect_recent_reproducers(array $roots, int $limit): array
                 $entries[] = [
                     'time' => $mtime,
                     'failure_type' => reproducer_failure_type($report, $rootType, $dir),
-                    'reproducing' => $reproducing ? 'yes' : 'no',
                     'path' => display_path($dir),
                 ];
             }
@@ -907,21 +917,19 @@ function render_recent_reproducers_table(array $entries): TableWidget
         $rows[] = TableRow::fromStrings(
             format_age((int) $entry['time'], $now),
             (string) $entry['failure_type'],
-            (string) $entry['reproducing'],
             (string) $entry['path'],
         );
     }
 
     if ($rows === []) {
-        $rows[] = TableRow::fromStrings('-', 'none', '-', 'no reproducers saved yet');
+        $rows[] = TableRow::fromStrings('-', 'none', 'no reproducers saved yet');
     }
 
     return TableWidget::default()
-        ->header(TableRow::fromStrings('Age', 'Failure', 'Repro', 'Path'))
+        ->header(TableRow::fromStrings('Age', 'Failure', 'Path'))
         ->widths(
             Constraint::length(7),
-            Constraint::length(16),
-            Constraint::length(6),
+            Constraint::length(32),
             Constraint::min(20),
         )
         ->rows(...$rows);
