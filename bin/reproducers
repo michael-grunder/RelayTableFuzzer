@@ -346,8 +346,8 @@ function extract_gdb_error_type(string $dir): ?string
                 continue;
             }
 
-            if ($function === null && preg_match('/^#0\s+.*?\bin\s+([^\s(]+)\s*(?:\(|$)/', $line, $matches) === 1) {
-                $function = $matches[1];
+            if ($function === null) {
+                $function = parse_gdb_frame_zero_function($line);
             }
 
             if ($signalType !== null && $function !== null) {
@@ -361,6 +361,20 @@ function extract_gdb_error_type(string $dir): ?string
     }
 
     return null;
+}
+
+function parse_gdb_frame_zero_function(string $line): ?string
+{
+    if (preg_match('/^#0\s+(?:(?:0x[[:xdigit:]]+\s+)?in\s+)?([^\s(]+)\s*(?:\(|$)/', $line, $matches) !== 1) {
+        return null;
+    }
+
+    $function = $matches[1];
+    if ($function === '??' || preg_match('/^0x[[:xdigit:]]+$/', $function) === 1) {
+        return null;
+    }
+
+    return $function;
 }
 
 /** @return list<string> */
