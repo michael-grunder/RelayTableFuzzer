@@ -54,6 +54,12 @@ To try reproducing a crash multiple times before classifying it, pass `--repro-t
 ./bin/harness --php-bin ./php85d --repro-tries 5 --ops 1000 --reduce -- ./bin/fuzzer --ops {ops} --seed {hrtime} --keys {range(1,500)}
 ```
 
+For tool-friendly progress output, use newline-delimited JSON instead of the TUI:
+
+```bash
+./bin/harness --output=jsonl --php-bin ./php85d --ops 1000 -- ./bin/fuzzer --ops {ops} --seed {hrtime}
+```
+
 ```bash
 ./bin/harness --php-bin /usr/bin/php --php-ini ./relay.ini -- ./bin/fuzzer --ops 1000 --mode random
 ```

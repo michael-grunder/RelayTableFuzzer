@@ -53,7 +53,7 @@ function usage(string $script): string
 {
     return <<<USAGE
 Usage:
-  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--valgrind[=PATH]] [--rr] [--rr-chaos-mode] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] [--repro-tries N] -- <command...>
+  {$script} --php-bin /path/to/php [--php-ini /path/to/php.ini] [-d ini=val] [--mode fuzz|script] [--output tui|jsonl] [--valgrind[=PATH]] [--rr] [--rr-chaos-mode] [--ops N] [--reduce] [--timeout N] [--timeout-signal SIG] [--only-crashes] [--capture-php-leaks] [--jobs N] [--interval SECONDS] [--repro-tries N] -- <command...>
 
 Dynamic replacements in command arguments and -d values:
   {range}            -> random integer
@@ -65,6 +65,7 @@ Notes:
   --valgrind is only supported with --mode=script.
   --rr records each run with rr record; --rr-chaos-mode also passes -h to rr.
   --rr and --valgrind are mutually exclusive.
+  --output=jsonl or --no-tui emits newline-delimited JSON status events for tool ingestion.
 USAGE;
 }
 
@@ -1141,10 +1142,44 @@ function render_screen(array $stats, ?int $currentOps, string $mode): void
     );
 }
 
-function maybe_render_screen(
+function render_jsonl_status(array $stats, ?int $currentOps, string $mode): void
+{
+    $now = microtime(true);
+    $lastFailureTime = $stats['last_failure_time'] ?? null;
+    $payload = [
+        'type' => 'status',
+        'timestamp' => date(DATE_ATOM, (int)$now),
+        'time' => $now,
+        'elapsed_seconds' => max(0, (int)round($now - (float)$stats['start_time'])),
+        'mode' => $mode,
+        'current_ops' => $currentOps,
+        'runs' => (int)$stats['runs'],
+        'active_jobs' => (int)($stats['active_jobs'] ?? 0),
+        'reproducers' => [
+            'total' => (int)($stats['reproducers'] ?? 0),
+            'reproducing' => (int)($stats['reproducers_reproducing'] ?? 0),
+        ],
+        'reductions' => (int)$stats['reductions'],
+        'last_failure' => [
+            'summary' => (string)($stats['last_failure_summary'] ?? ''),
+            'time' => is_float($lastFailureTime) ? $lastFailureTime : null,
+            'seconds_ago' => is_float($lastFailureTime) ? max(0, (int)round($now - $lastFailureTime)) : null,
+        ],
+        'last_event' => (string)($stats['last_event'] ?? ''),
+        'last_reproducer' => $stats['last_reproducer'] !== '' ? display_path((string)$stats['last_reproducer']) : null,
+        'last_command' => (string)($stats['last_command'] ?? ''),
+        'relay_memory' => $stats['relay_memory'] ?? null,
+    ];
+
+    fwrite(STDOUT, json_encode($payload, JSON_UNESCAPED_SLASHES) . "\n");
+    fflush(STDOUT);
+}
+
+function maybe_render_output(
     array $stats,
     ?int $currentOps,
     string $mode,
+    string $outputMode,
     float $interval,
     float &$lastRenderTime,
     bool $force = false
@@ -1155,6 +1190,11 @@ function maybe_render_screen(
     }
 
     $lastRenderTime = $now;
+    if ($outputMode === 'jsonl') {
+        render_jsonl_status($stats, $currentOps, $mode);
+        return;
+    }
+
     render_screen($stats, $currentOps, $mode);
 }
 
@@ -1818,6 +1858,7 @@ function reduce_ops(
     ?string $rrBin,
     bool $rrChaosMode,
     bool $onlyCrashes,
+    string $outputMode,
     float $renderInterval,
     float &$lastRenderTime
 ): int {
@@ -1857,7 +1898,7 @@ function reduce_ops(
             generate_gdb_backtraces($movedCores, $jobDir, $phpBin);
         }
         cleanup_output_files($result);
-        maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
+        maybe_render_output($stats, $mid, 'reducing', $outputMode, $renderInterval, $lastRenderTime, $result['is_crash']);
         if ($result['is_crash']) {
             $high = $mid;
             continue;
@@ -1884,6 +1925,7 @@ function reduce_ops_script(
     ?string $rrBin,
     bool $rrChaosMode,
     bool $onlyCrashes,
+    string $outputMode,
     float $renderInterval,
     float &$lastRenderTime
 ): int {
@@ -1946,7 +1988,7 @@ function reduce_ops_script(
         }
         cleanup_output_files($result);
         remove_dir_recursive($scriptDir);
-        maybe_render_screen($stats, $mid, 'reducing', $renderInterval, $lastRenderTime, $result['is_crash']);
+        maybe_render_output($stats, $mid, 'reducing', $outputMode, $renderInterval, $lastRenderTime, $result['is_crash']);
         if ($result['is_crash']) {
             $high = $mid;
             continue;
@@ -2607,6 +2649,7 @@ $phpArgs = [];
 $ops = null;
 $reduce = false;
 $harnessMode = 'fuzz';
+$outputMode = 'tui';
 $onlyCrashes = false;
 $capturePhpLeaks = false;
 $maxSeconds = null;
@@ -2684,6 +2727,21 @@ for ($i = 1; $i < $argc; $i++) {
 
     if (str_starts_with($arg, '--mode=')) {
         $harnessMode = strtolower(substr($arg, strlen('--mode=')));
+        continue;
+    }
+
+    if ($arg === '--output') {
+        $outputMode = strtolower((string) ($argv[++$i] ?? ''));
+        continue;
+    }
+
+    if (str_starts_with($arg, '--output=')) {
+        $outputMode = strtolower(substr($arg, strlen('--output=')));
+        continue;
+    }
+
+    if ($arg === '--no-tui') {
+        $outputMode = 'jsonl';
         continue;
     }
 
@@ -2845,6 +2903,13 @@ if ($harnessMode === '') {
 }
 if (!in_array($harnessMode, ['fuzz', 'script'], true)) {
     fwrite(STDERR, "Invalid --mode: {$harnessMode} (use fuzz or script)\n");
+    fwrite(STDERR, usage($argv[0]) . "\n");
+    exit(1);
+}
+
+$outputMode = strtolower(trim($outputMode));
+if (!in_array($outputMode, ['tui', 'jsonl'], true)) {
+    fwrite(STDERR, "Invalid --output: {$outputMode} (use tui or jsonl)\n");
     fwrite(STDERR, usage($argv[0]) . "\n");
     exit(1);
 }
@@ -3030,10 +3095,11 @@ while (true) {
         }
 
         $stats['active_jobs'] = count($runningJobs);
-        maybe_render_screen(
+        maybe_render_output(
             $stats,
             $currentOps,
             $stopAfterCrash ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
+            $outputMode,
             $renderInterval,
             $lastRenderTime,
             $result['is_crash'] || $leakCount !== null
@@ -3041,10 +3107,11 @@ while (true) {
     }
     unset($job);
 
-    maybe_render_screen(
+    maybe_render_output(
         $stats,
         $currentOps,
         $stopAfterCrash ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
+        $outputMode,
         $renderInterval,
         $lastRenderTime
     );
@@ -3078,6 +3145,7 @@ while (true) {
                     $rrBin,
                     $rrChaosMode,
                     $onlyCrashes,
+                    $outputMode,
                     $renderInterval,
                     $lastRenderTime
                 );
@@ -3097,6 +3165,7 @@ while (true) {
                     $rrBin,
                     $rrChaosMode,
                     $onlyCrashes,
+                    $outputMode,
                     $renderInterval,
                     $lastRenderTime
                 );
@@ -3203,7 +3272,7 @@ while (true) {
             && in_array($signal, CRASH_SIGNALS, true)
         ) {
             $stats['last_event'] = 'capturing rr backtrace';
-            maybe_render_screen($stats, $currentOps, 'capturing', $renderInterval, $lastRenderTime, true);
+            maybe_render_output($stats, $currentOps, 'capturing', $outputMode, $renderInterval, $lastRenderTime, true);
             $rrBacktracePath = generate_rr_backtrace($rrBin, $jobDir . '/' . $rrTraceDir, $jobDir);
         }
 
@@ -3358,10 +3427,11 @@ while (true) {
         $stats['last_event'] = 'reproducer saved: ' . display_path($finalJobDir);
         $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
-        maybe_render_screen(
+        maybe_render_output(
             $stats,
             $currentOps,
             $reduce ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
+            $outputMode,
             $renderInterval,
             $lastRenderTime,
             true
@@ -3604,10 +3674,11 @@ while (true) {
         $stats['last_event'] = 'leak saved: ' . display_path($finalJobDir);
         $stats['last_reproducer'] = $finalJobDir;
         $stats['active_jobs'] = 0;
-        maybe_render_screen(
+        maybe_render_output(
             $stats,
             $currentOps,
             $reduce ? 'reducing' : ($harnessMode === 'script' ? 'script' : 'fuzzing'),
+            $outputMode,
             $renderInterval,
             $lastRenderTime,
             true
